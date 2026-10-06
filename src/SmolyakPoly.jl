@@ -9,6 +9,7 @@ export BoxDomain, SmolyakGrid, ChebyshevBasisSpec, FitPlan,
        SmolyakApproximation, dimension, project, to_canonical,
        from_canonical, sobol, evaluate_nodes, fit, fit!, coefficients,
        basis_vector, basis_matrix, prepare, available_backends, save
+export prepare_gradient, prepare_hessian
 
 const FORMAT_VERSION = 1
 const MultiIndex{D} = NTuple{D,Int}
@@ -365,6 +366,38 @@ end
         current = following
     end
     return current
+end
+
+"""
+    _chebyshev_value_derivatives(order, x)
+
+Evaluate `T_order(x)` and its first two derivatives with respect to canonical
+coordinate `x`. Differentiating the three-term Chebyshev recurrence avoids
+division near roots and endpoints and returns a type-stable three-tuple.
+"""
+@inline function _chebyshev_value_derivatives(order::Int, x::T) where {T}
+    order == 0 && return (one(T), zero(T), zero(T))
+    order == 1 && return (x, one(T), zero(T))
+
+    previous_value = one(T)
+    value = x
+    previous_first = zero(T)
+    first = one(T)
+    previous_second = zero(T)
+    second = zero(T)
+
+    for _ in 2:order
+        following_value = muladd(T(2) * x, value, -previous_value)
+        following_first = T(2) * value + T(2) * x * first - previous_first
+        following_second = T(4) * first + T(2) * x * second - previous_second
+        previous_value = value
+        value = following_value
+        previous_first = first
+        first = following_first
+        previous_second = second
+        second = following_second
+    end
+    return (value, first, second)
 end
 
 """Check the shape and membership of one point, throwing a domain-specific error."""
@@ -798,12 +831,185 @@ function basis_matrix(evaluator::CPUPreparedEvaluator{D,T}, X::AbstractMatrix) w
     return result
 end
 
+# ------------------------------------------------------------------------------
+# Prepared gradient and Hessian evaluators
+# ------------------------------------------------------------------------------
+
+"""
+    CPUGradientEvaluator
+
+Prepared CPU data for gradients with respect to physical coordinates. Calls on
+one point return `Vector{T}`; calls on `N` point rows return `Matrix{T}` of size
+`N × D`.
+"""
+struct CPUGradientEvaluator{D,T<:AbstractFloat,Dom}
+    domain::Dom
+    coeffs::Vector{T}
+    indices::Matrix{Int}
+end
+
+"""
+    CPUHessianEvaluator
+
+Prepared CPU data for Hessians with respect to physical coordinates. Calls on
+one point return a `D × D` matrix. Calls on `N` point rows return a vector of
+`N` such matrices.
+"""
+struct CPUHessianEvaluator{D,T<:AbstractFloat,Dom}
+    domain::Dom
+    coeffs::Vector{T}
+    indices::Matrix{Int}
+end
+
+"""Fill prefix and suffix products for one tensor-product basis term."""
+@inline function _fill_product_sides!(prefix, suffix, values, D::Int)
+    prefix[1] = one(eltype(prefix))
+    for d in 1:D
+        prefix[d + 1] = prefix[d] * values[d]
+    end
+    suffix[D + 1] = one(eltype(suffix))
+    for d in D:-1:1
+        suffix[d] = suffix[d + 1] * values[d]
+    end
+    return nothing
+end
+
+"""Fill a physical-coordinate gradient without allocating term vectors."""
+function _gradient_point!(output, evaluator::CPUGradientEvaluator{D,T}, x,
+                          values, firsts, prefix, suffix) where {D,T}
+    fill!(output, zero(T))
+    for k in axes(evaluator.indices, 1)
+        for d in 1:D
+            xi = (T(x[d]) - T(evaluator.domain.center[d])) *
+                 T(evaluator.domain.invhalfwidth[d])
+            value, first, _ = _chebyshev_value_derivatives(
+                evaluator.indices[k, d], xi)
+            values[d] = value
+            firsts[d] = first * T(evaluator.domain.invhalfwidth[d])
+        end
+        _fill_product_sides!(prefix, suffix, values, D)
+        coefficient = evaluator.coeffs[k]
+        for d in 1:D
+            output[d] = muladd(coefficient * firsts[d],
+                               prefix[d] * suffix[d + 1], output[d])
+        end
+    end
+    return output
+end
+
+"""Fill a physical-coordinate Hessian using `O(D)` term workspace."""
+function _hessian_point!(output, evaluator::CPUHessianEvaluator{D,T}, x,
+                         values, firsts, seconds, prefix, suffix) where {D,T}
+    fill!(output, zero(T))
+    for k in axes(evaluator.indices, 1)
+        for d in 1:D
+            scale = T(evaluator.domain.invhalfwidth[d])
+            xi = (T(x[d]) - T(evaluator.domain.center[d])) * scale
+            value, first, second = _chebyshev_value_derivatives(
+                evaluator.indices[k, d], xi)
+            values[d] = value
+            firsts[d] = first * scale
+            seconds[d] = second * scale * scale
+        end
+        _fill_product_sides!(prefix, suffix, values, D)
+        coefficient = evaluator.coeffs[k]
+        for j in 1:D
+            output[j, j] = muladd(coefficient * seconds[j],
+                                  prefix[j] * suffix[j + 1], output[j, j])
+            middle_product = one(T)
+            for l in (j + 1):D
+                if l > j + 1
+                    middle_product *= values[l - 1]
+                end
+                other_product = prefix[j] * middle_product * suffix[l + 1]
+                contribution = coefficient * firsts[j] * firsts[l] * other_product
+                output[j, l] += contribution
+                output[l, j] += contribution
+            end
+        end
+    end
+    return output
+end
+
+"""Evaluate a prepared physical-coordinate gradient at one point."""
+function (evaluator::CPUGradientEvaluator{D,T})(x::AbstractVector) where {D,T}
+    _validate_point(evaluator.domain, x)
+    output = Vector{T}(undef, D)
+    values = Vector{T}(undef, D)
+    firsts = Vector{T}(undef, D)
+    prefix = Vector{T}(undef, D + 1)
+    suffix = Vector{T}(undef, D + 1)
+    return _gradient_point!(output, evaluator, x, values, firsts, prefix, suffix)
+end
+
+"""Evaluate prepared gradients for `N` point rows, returning an `N × D` matrix."""
+function (evaluator::CPUGradientEvaluator{D,T})(X::AbstractMatrix) where {D,T}
+    _validate_points(evaluator.domain, X)
+    output = Matrix{T}(undef, size(X, 1), D)
+    values = Vector{T}(undef, D)
+    firsts = Vector{T}(undef, D)
+    prefix = Vector{T}(undef, D + 1)
+    suffix = Vector{T}(undef, D + 1)
+    for i in axes(X, 1)
+        _gradient_point!(@view(output[i, :]), evaluator, @view(X[i, :]),
+                         values, firsts, prefix, suffix)
+    end
+    return output
+end
+
+
+"""Evaluate a prepared physical-coordinate Hessian at one point."""
+function (evaluator::CPUHessianEvaluator{D,T})(x::AbstractVector) where {D,T}
+    _validate_point(evaluator.domain, x)
+    output = Matrix{T}(undef, D, D)
+    values = Vector{T}(undef, D)
+    firsts = Vector{T}(undef, D)
+    seconds = Vector{T}(undef, D)
+    prefix = Vector{T}(undef, D + 1)
+    suffix = Vector{T}(undef, D + 1)
+    return _hessian_point!(output, evaluator, x, values, firsts, seconds,
+                           prefix, suffix)
+end
+
+"""Evaluate prepared Hessians for `N` rows, returning `Vector{Matrix{T}}`."""
+function (evaluator::CPUHessianEvaluator{D,T})(X::AbstractMatrix) where {D,T}
+    _validate_points(evaluator.domain, X)
+    output = [Matrix{T}(undef, D, D) for _ in axes(X, 1)]
+    values = Vector{T}(undef, D)
+    firsts = Vector{T}(undef, D)
+    seconds = Vector{T}(undef, D)
+    prefix = Vector{T}(undef, D + 1)
+    suffix = Vector{T}(undef, D + 1)
+    for i in axes(X, 1)
+        _hessian_point!(output[i], evaluator, @view(X[i, :]), values, firsts,
+                        seconds, prefix, suffix)
+    end
+    return output
+end
+
 const _BACKEND_FACTORIES = Dict{Symbol,Any}()
+const _GRADIENT_BACKEND_FACTORIES = Dict{Symbol,Any}()
+const _HESSIAN_BACKEND_FACTORIES = Dict{Symbol,Any}()
 
 """Register an optional backend factory. Intended for sidecar extensions."""
 function _register_backend!(name::Symbol, factory)
     name in (:cpu, :auto) && throw(ArgumentError("backend name $name is reserved"))
     _BACKEND_FACTORIES[name] = factory
+    return name
+end
+
+"""Register an optional prepared-gradient backend factory."""
+function _register_gradient_backend!(name::Symbol, factory)
+    name in (:cpu, :auto) && throw(ArgumentError("backend name $name is reserved"))
+    _GRADIENT_BACKEND_FACTORIES[name] = factory
+    return name
+end
+
+
+"""Register an optional prepared-Hessian backend factory."""
+function _register_hessian_backend!(name::Symbol, factory)
+    name in (:cpu, :auto) && throw(ArgumentError("backend name $name is reserved"))
+    _HESSIAN_BACKEND_FACTORIES[name] = factory
     return name
 end
 
@@ -834,6 +1040,51 @@ function prepare(res::SmolyakApproximation; T::Type{<:AbstractFloat} =
     factory === nothing && throw(ArgumentError(
         "backend $selected is unavailable; loaded backends are " *
         "$(available_backends()). Load its optional sidecar first."))
+    return factory(res, T)
+end
+
+"""
+    prepare_gradient(res; T=eltype(coefficients(res)), backend=:cpu)
+
+Prepare repeated evaluation of the gradient of `res` with respect to physical
+coordinates. A point call returns `Vector{T}` of length `D`; an `N × D` batch
+returns `Matrix{T}` of size `N × D`. `:auto` currently selects CPU. Optional
+extensions provide GPU factories while preserving explicit precision.
+"""
+function prepare_gradient(res::SmolyakApproximation;
+                          T::Type{<:AbstractFloat} = eltype(res.coeffs),
+                          backend::Symbol = :cpu)
+    selected = backend === :auto ? :cpu : backend
+    if selected === :cpu
+        return CPUGradientEvaluator{dimension(res),T,typeof(res.domain)}(
+            res.domain, T.(res.coeffs), _index_matrix(res.basis.indices))
+    end
+    factory = get(_GRADIENT_BACKEND_FACTORIES, selected, nothing)
+    factory === nothing && throw(ArgumentError(
+        "gradient backend $selected is unavailable; load its optional " *
+        "extension before calling prepare_gradient"))
+    return factory(res, T)
+end
+
+"""
+    prepare_hessian(res; T=eltype(coefficients(res)), backend=:cpu)
+
+Prepare repeated evaluation of the Hessian of `res` with respect to physical
+coordinates. A point call returns a `D × D Matrix{T}`; an `N × D` batch returns
+`Vector{Matrix{T}}` with one Hessian per row. `:auto` currently selects CPU.
+"""
+function prepare_hessian(res::SmolyakApproximation;
+                         T::Type{<:AbstractFloat} = eltype(res.coeffs),
+                         backend::Symbol = :cpu)
+    selected = backend === :auto ? :cpu : backend
+    if selected === :cpu
+        return CPUHessianEvaluator{dimension(res),T,typeof(res.domain)}(
+            res.domain, T.(res.coeffs), _index_matrix(res.basis.indices))
+    end
+    factory = get(_HESSIAN_BACKEND_FACTORIES, selected, nothing)
+    factory === nothing && throw(ArgumentError(
+        "Hessian backend $selected is unavailable; load its optional " *
+        "extension before calling prepare_hessian"))
     return factory(res, T)
 end
 

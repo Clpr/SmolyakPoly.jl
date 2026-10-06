@@ -18,6 +18,21 @@ using SmolyakPoly
     @test Array(output1) ≈ result(Float32, points) rtol = 5f-5
     @test Array(output2) ≈ Array(output1)
     @test basis_matrix(evaluator, points) isa Metal.MtlArray
+    gradient_evaluator = prepare_gradient(result; T = Float32, backend = :metal)
+    hessian_evaluator = prepare_hessian(result; T = Float32, backend = :metal)
+    expected_gradients = hcat(2f0 .* points[:, 1], ones(Float32, 3))
+    expected_hessian = Float32[2 0; 0 0]
+    @test gradient_evaluator(points) ≈ expected_gradients rtol = 5f-5
+    @test gradient_evaluator(@view points[1, :]) ≈
+          expected_gradients[1, :] rtol = 5f-5
+    @test all(hessian -> hessian ≈ expected_hessian,
+              hessian_evaluator(points))
+    @test hessian_evaluator(@view points[1, :]) ≈
+          expected_hessian rtol = 5f-5
     @test_throws ArgumentError prepare(result; T = Float64, backend = :metal)
+    @test_throws ArgumentError prepare_gradient(
+        result; T = Float64, backend = :metal)
+    @test_throws ArgumentError prepare_hessian(
+        result; T = Float64, backend = :metal)
     @test :metal in available_backends()
 end

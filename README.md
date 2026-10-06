@@ -553,7 +553,50 @@ precision unchanged; future benchmark-supported policies can use the same API.
 Prepared evaluators are not serialized. They are cheap runtime views of a
 persistent approximation and should be reconstructed in each process.
 
-### 9. Refit without rebuilding structural work
+### 9. Prepare gradient and Hessian evaluators
+
+Derivatives are taken with respect to physical domain coordinates, including
+the affine chain-rule factors from the canonical box. Prepare them separately
+when derivatives will be evaluated repeatedly:
+
+```julia
+x_test = rand(res.domain)
+X_test = rand(res.domain, 100)
+
+gradient_evaluator = prepare_gradient(
+    res; T = Float64, backend = :cpu)
+hessian_evaluator = prepare_hessian(
+    res; T = Float64, backend = :cpu)
+
+gradient = gradient_evaluator(x_test)       # Vector{Float64}, length D
+gradients = gradient_evaluator(X_test)      # 100 × D Matrix{Float64}
+hessian = hessian_evaluator(x_test)         # D × D Matrix{Float64}
+hessians = hessian_evaluator(X_test)        # Vector{Matrix{Float64}}
+```
+
+The derivative recurrence and domain metadata are prepared once. CUDA and Metal
+use the same API:
+
+```julia
+import CUDA
+
+gpu_gradient = prepare_gradient(res; T = Float32, backend = :cuda)
+gpu_hessian = prepare_hessian(res; T = Float32, backend = :cuda)
+
+gradients32 = gpu_gradient(X_test)  # Matrix{Float32}
+hessians32 = gpu_hessian(X_test)    # Vector{Matrix{Float32}}
+```
+
+GPU derivative kernels perform the polynomial work on the device and return
+ordinary host arrays in the requested arithmetic type. Derivatives can amplify
+node-level fitting error and high-order polynomial oscillation, so validate them
+more carefully than function values. These evaluators differentiate the fitted
+polynomial; they do not impose monotonicity, concavity, or Hessian definiteness.
+
+Like ordinary prepared evaluators, prepared derivative evaluators contain a
+coefficient snapshot and should be recreated after `fit!`.
+
+### 10. Refit without rebuilding structural work
 
 When new values become available on the same grid, reuse the plan:
 
@@ -581,7 +624,7 @@ cpu_eval = prepare(res; T = Float64, backend = :cpu)
 
 This explicit refresh avoids hidden synchronization or device transfers.
 
-### 10. Save persistent mathematical objects
+### 11. Save persistent mathematical objects
 
 Domains, grids, basis specifications, and fitted approximations support
 versioned JSON serialization:
