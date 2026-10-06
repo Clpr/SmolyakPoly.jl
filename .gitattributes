@@ -1,0 +1,7 @@
+# Keep source text stable when moving between Windows, WSL, macOS and Linux.
+* text=auto
+*.jl text eol=lf
+*.toml text eol=lf
+*.md text eol=lf
+*.yml text eol=lf
+*.pdf binary
