@@ -21,6 +21,83 @@ The current scope is deliberately focused:
 - CPU support is always available, while CUDA and Metal are optional;
 - points in a batch are rows of a dense `N × D` matrix.
 
+## Motivation
+
+### The numerical problem in quantitative economics
+
+Modern quantitative economic models can place demanding and sometimes
+conflicting requirements on a function approximator. Value and policy functions
+may depend on many individual, aggregate, and distributional state variables,
+while evaluating the function at even one state can require solving a costly
+conditional optimization or equilibrium problem. A full tensor grid becomes
+impractical quickly, but an approximation still needs enough global information
+to behave reliably away from a small set of familiar states.
+
+Economic structure also matters. The underlying value or policy function is
+often expected to be smooth and may be known theoretically to be monotone or
+concave over relevant regions. Numerical approximations should respect such
+shape information as closely as possible because derivatives, first-order
+conditions, and subsequent policy iterations can be more sensitive to local
+artifacts than function values alone.
+
+At the same time, values computed at collocation nodes are rarely exact. A
+conditional optimizer has finite stopping tolerances; active constraints can
+switch; inner fixed points may terminate at slightly different accuracies; and
+warm starts or simulation error can produce small node-to-node discrepancies.
+An exact interpolant is forced through every such discrepancy. Even when the
+true economic function is smooth, fitting every noisy node exactly can introduce
+unfavorable overshoots, artificial local curvature, or small twists. Those
+features can contaminate derivatives and expectations and, in difficult cases,
+destabilize the outer value-function or policy iteration.
+
+Finally, the computational workload is asymmetric. Solves at distinct grid
+nodes are usually embarrassingly parallel but expensive. Once an approximation
+has been fitted, it may be evaluated vastly more often—for example, while
+computing conditional expectations inside the many optimization problems of the
+next iteration. The best hardware strategy for producing training values is
+therefore not necessarily the best strategy for mass evaluation of the fitted
+surrogate.
+
+### The approach taken here
+
+There is no single approximation method for every high-dimensional economic
+model. Deep-learning approaches, including
+[`DeepHAM`](https://doi.org/10.3982/QE2190), use neural networks and learned
+low-dimensional representations to address particularly high-dimensional
+heterogeneous-agent problems. More traditional global methods remain attractive
+when sparse structure and smoothness make a polynomial representation feasible,
+and when transparent basis coefficients, deterministic nodes, and conventional
+linear algebra are desirable.
+
+SmolyakPoly.jl takes the latter route by combining a sparse Smolyak-style Leja
+grid with a Chebyshev polynomial basis, but it does not require the sampling grid
+and polynomial space to coincide. This separation supports a useful
+noise-filtering workflow:
+
+1. Evaluate the economic model on a comparatively rich sparse grid.
+2. Fit a lower-order polynomial space by overdetermined least squares instead
+   of forcing the approximation through every computed node value.
+3. Optionally add ridge regularization to shrink poorly determined coefficient
+   combinations and favor a lower-amplitude polynomial representation.
+
+When node-level discrepancies are small relative to the underlying smooth
+signal, the lower-order fit can filter some of those numerical glitches and
+reduce artificial local curvature. Ridge regularization can strengthen that
+effect when the chosen basis is larger or less well determined. These are
+regularization mechanisms, not shape constraints: the package does **not**
+guarantee monotonicity, concavity, positivity, or the complete removal of
+optimization error. Users who require exact shape preservation should validate
+those properties explicitly or apply an appropriate constrained method.
+
+The execution model follows the same separation of concerns. Expensive node
+evaluations and QR-based fitting run on the CPU, with optional Julia
+multithreading for independent node solves. The resulting polynomial can then be
+`prepare`d for repeated evaluation at an explicit precision on the CPU, an
+NVIDIA GPU through CUDA, or an Apple GPU through Metal. In a typical iterative
+model, `FitPlan` reuses the design matrix and factorization from one iteration to
+the next, while a newly prepared GPU evaluator accelerates the much larger
+number of surrogate calls needed for expectations and conditional optimization.
+
 ## Mathematics
 
 Let the physical domain be the box
@@ -552,6 +629,10 @@ Y_repeated = evaluator(X)
 
 ## References
 
+- Jiequn Han, Yucheng Yang, and Weinan E (2026), “DeepHAM: A Global
+  Solution Method for Heterogeneous Agent Models with Aggregate Shocks,”
+  *Quantitative Economics*, 17(2), 297–341.
+  [doi:10.3982/QE2190](https://doi.org/10.3982/QE2190)
 - Kenneth L. Judd, Lilia Maliar, Serguei Maliar, and Rafael Valero (2014),
   “Smolyak Method for Solving Dynamic Economic Models: Lagrange Interpolation,
   Anisotropic Grid and Adaptive Domain,” *Journal of Economic Dynamics and
