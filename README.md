@@ -467,6 +467,10 @@ x_projected = project(domain, [100.0, 0.0, 5.0])
 res(x_projected)
 ```
 
+Noticeably, repeatly evaluating the fitted object will reconstruct the same metadata and transfer unchanged coeficients for many times, which creates huge overhead cost. It is strongly recommended to "prepare" an evaluator in this case. (See later section for the preparation)
+
+
+
 ### 7. Inspect the basis when needed
 
 Ordinary prediction evaluates Chebyshev recurrences and accumulates
