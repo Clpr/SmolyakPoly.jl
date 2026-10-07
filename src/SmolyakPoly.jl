@@ -1,43 +1,77 @@
+# ==============================================================================
 module SmolyakPoly
-
+# ==============================================================================
 using LinearAlgebra
 using Random
 using JSON3
 using Sobol
 
-export BoxDomain, SmolyakGrid, ChebyshevBasisSpec, FitPlan,
-       SmolyakApproximation, dimension, project, to_canonical,
-       from_canonical, sobol, evaluate_nodes, fit, fit!, coefficients,
-       basis_vector, basis_matrix, prepare, available_backends, save
+export BoxDomain, SmolyakGrid, ChebyshevBasisSpec, FitPlan, SmolyakApproximation
+export dimension, project, to_canonical, from_canonical, sobol, evaluate_nodes
+export fit, fit!, coefficients, basis_vector, basis_matrix, prepare
+export available_backends, save
 export prepare_gradient, prepare_hessian
 
+
+
+
+
+
+
+# ==============================================================================
+# Constants & Alias
+# ==============================================================================
+# version of exported file. For backward loading compatability
 const FORMAT_VERSION = 1
+
+# alias: node multi-index
 const MultiIndex{D} = NTuple{D,Int}
 
-# ------------------------------------------------------------------------------
-# Validation and index construction
-# ------------------------------------------------------------------------------
 
-"""Return `x` as a length-`D` tuple of values converted to `T`."""
+
+
+
+
+
+
+# ==============================================================================
+# Validation and index construction
+# ==============================================================================
+"""
+    _point_tuple(::Type{T}, x, D::Int, name::AbstractString) where {T}
+
+INTERNAL METHOD.
+
+Convert `x` to a length-`D` tuple of values converted to `T`. 
+Used to align data types.
+"""
 function _point_tuple(::Type{T}, x, D::Int, name::AbstractString) where {T}
     length(x) == D || throw(DimensionMismatch(
-        "$name must have length $D; received length $(length(x))"))
+        "$name must have length $D; received length $(length(x))"
+    ))
     return ntuple(d -> convert(T, x[d]), D)
 end
-
+# ------------------------------------------------------------------------------
 """
-    _lower_indices(caps, budget)
+    _lower_indices(caps::NTuple{D,Int}, budget::Int) where {D}
+
+INTERNAL METHOD.
 
 Construct the deterministic lower multi-index set
-`{alpha : 0 <= alpha[d] <= caps[d], sum(alpha) <= budget}`. Indices are
-ordered by total degree and then lexicographically.
+`{alpha : 0 <= alpha[d] <= caps[d], sum(alpha) <= budget}`. Indices are ordered 
+by total degree and then lexicographically. Used in grid and basis specs.
 """
 function _lower_indices(caps::NTuple{D,Int}, budget::Int) where {D}
+    
     budget >= 0 || throw(ArgumentError("the total budget must be nonnegative"))
+    
     all(>=(0), caps) || throw(ArgumentError(
-        "all coordinate caps must be nonnegative; received $caps"))
-    result = MultiIndex{D}[]
+        "all coordinate caps must be nonnegative; received $caps"
+    ))
+    
+    result  = MultiIndex{D}[]
     current = zeros(Int, D)
+    
     function visit!(coordinate::Int, remaining::Int)
         if coordinate > D
             push!(result, ntuple(d -> current[d], Val(D)))
@@ -52,8 +86,15 @@ function _lower_indices(caps::NTuple{D,Int}, budget::Int) where {D}
     sort!(result; by = alpha -> (sum(alpha), alpha))
     return result
 end
+# ------------------------------------------------------------------------------
+"""
+    _index_matrix(indices::Vector{MultiIndex{D}}) where {D}
 
-"""Return a matrix whose rows contain the supplied multi-indices."""
+INTERNAL METHOD.
+
+Return a matrix whose rows contain the supplied multi-indices. Used in evaluator
+preparations.
+"""
 function _index_matrix(indices::Vector{MultiIndex{D}}) where {D}
     matrix = Matrix{Int}(undef, length(indices), D)
     for k in eachindex(indices), d in 1:D
@@ -62,10 +103,15 @@ function _index_matrix(indices::Vector{MultiIndex{D}}) where {D}
     return matrix
 end
 
-# ------------------------------------------------------------------------------
-# Box domain
-# ------------------------------------------------------------------------------
 
+
+
+
+
+
+# ==============================================================================
+# Box domain
+# ==============================================================================
 """
     BoxDomain(lb, ub)
 
@@ -73,46 +119,126 @@ Describe a finite Cartesian product of closed intervals. `lb` and `ub` may be
 any indexable, finite real vectors of equal positive length. Their values are
 promoted to a floating-point type. The returned `BoxDomain{D,T}` caches the
 affine map between physical coordinates and `[-1,1]^D`.
+
+## Usage Example
+```
+import Random
+import SmolyakPoly as smx
+
+# construction
+xspace = smx.BoxDomain([-1,-2,-3],[1,2,3])
+display(xspace)
+
+# meta info
+smx.dimension(xspace)
+
+# check if a point falls into the space
+rand(3) ∈ xspace
+
+# truncate a possibly out-of-space point to the closed space
+x0 = rand(3) * 100
+smx.project(xspace, x0)
+
+# affine to [-1,1]^n
+x0 = rand(3)
+x1 = smx.to_canonical(xspace, x0)
+
+# inverse affine to xspace
+x2 = smx.from_canonical(xspace, x1)
+isapprox.(x0,x2,atol=1E-12)
+
+# random point drawing
+rand(xspace)
+rand(xspace, 100)
+rand(Random.default_rng(), xspace, 100)
+rand(Random.default_rng(), xspace)
+
+# pseudo Monte-Carlo drawing, Sobol sequence
+smx.sobol(xspace, 100)
+
+# save to disk & recover
+# smx.save(xspace, "xspace.json")
+# xspace = smx.BoxDomain("xspace.json")
+```
 """
 struct BoxDomain{D,T<:AbstractFloat}
-    lb::NTuple{D,T}
-    ub::NTuple{D,T}
-    center::NTuple{D,T}
-    halfwidth::NTuple{D,T}
+    
+    lb          ::NTuple{D,T}
+    ub          ::NTuple{D,T}
+
+    # cache for fast eval
+    center      ::NTuple{D,T}
+    width       ::NTuple{D,T}
+    halfwidth   ::NTuple{D,T}
     invhalfwidth::NTuple{D,T}
 end
-
+# ------------------------------------------------------------------------------
+function Base.show(io::IO, domain::BoxDomain{D,T}) where {D,T}
+    print(io, "BoxDomain{$D,$T}(")
+    for d in 1:D
+        d > 1 && print(io, ", ")
+        print(io, "[", domain.lb[d], ", ", domain.ub[d], "]")
+    end
+    print(io, ")")
+end
+# ------------------------------------------------------------------------------
 function BoxDomain(lb, ub)
+    
     length(lb) == length(ub) || throw(DimensionMismatch(
         "lower and upper bounds must have equal lengths; received " *
-        "$(length(lb)) and $(length(ub))"))
+        "$(length(lb)) and $(length(ub))"
+    ))
+    
     D = length(lb)
-    D >= 1 || throw(ArgumentError("a box domain must have at least one dimension"))
-    T = promote_type(map(x -> typeof(float(x)), lb)...,
-                     map(x -> typeof(float(x)), ub)...)
-    T <: AbstractFloat || throw(ArgumentError("bounds must promote to a floating type"))
+    D >= 1 || throw(ArgumentError(
+        "a box domain must have at least one dimension"
+    ))
+    
+    # infer dtype
+    T = promote_type(
+        map(x -> typeof(float(x)), lb)...,
+        map(x -> typeof(float(x)), ub)...
+    )
+    T <: AbstractFloat || throw(ArgumentError(
+        "bounds must promote to a floating type"
+    ))
+    
+    # type alignment
     lower = _point_tuple(T, lb, D, "lower bounds")
     upper = _point_tuple(T, ub, D, "upper bounds")
+    
+    # validation
     for d in 1:D
-        isfinite(lower[d]) || throw(ArgumentError("lower bound $d is not finite"))
-        isfinite(upper[d]) || throw(ArgumentError("upper bound $d is not finite"))
+        isfinite(lower[d]) || throw(ArgumentError(
+            "lower bound $d is not finite"
+        ))
+        isfinite(upper[d]) || throw(ArgumentError(
+            "upper bound $d is not finite"
+        ))
         lower[d] < upper[d] || throw(ArgumentError(
             "lower bound $d must be less than its upper bound; received " *
-            "$(lower[d]) and $(upper[d])"))
+            "$(lower[d]) and $(upper[d])"
+        ))
     end
-    two = T(2)
-    center = ntuple(d -> (lower[d] + upper[d]) / two, D)
+
+    # cache intermediate variables for affine
+    two       = T(2) # type match
+    center    = ntuple(d -> (lower[d] + upper[d]) / two, D)
+    width     = ntuple(d -> (upper[d] - lower[d]), D)
     halfwidth = ntuple(d -> (upper[d] - lower[d]) / two, D)
-    inverse = ntuple(d -> inv(halfwidth[d]), D)
-    return BoxDomain{D,T}(lower, upper, center, halfwidth, inverse)
+    inverse   = ntuple(d -> inv(halfwidth[d]), D)
+
+    return BoxDomain{D,T}(lower, upper, center, width, halfwidth, inverse)
 end
 
-"""Load a `BoxDomain` from a versioned JSON file written by [`save`](@ref)."""
-BoxDomain(path::AbstractString) = _load_domain(_read_json(path))
-
-"""Return the mathematical dimension encoded by an object."""
+# BASE OVERLOADS ---------------------------------------------------------------
+"""
+    dimension(::BoxDomain{D}) where {D}
+    
+Return the mathematical dimension encoded by a `BoxDomain`.
+"""
 dimension(::BoxDomain{D}) where {D} = D
-
+# ------------------------------------------------------------------------------
 """
     x in domain
 
@@ -128,47 +254,115 @@ function Base.in(x, domain::BoxDomain{D,T}) where {D,T}
     end
 end
 
-"""Project vector-like point `x` coordinatewise onto `domain`."""
+# DISK IO ----------------------------------------------------------------------
+"""
+    BoxDomain(path::AbstractString)
+
+Load a `BoxDomain` from a versioned JSON file written by [`save`](@ref).
+"""
+BoxDomain(path::AbstractString) = _load_domain(_read_json(path))
+
+# MATH OPERATIONS --------------------------------------------------------------
+"""
+    project(domain::BoxDomain{D,T}, x) where {D,T}
+
+Project vector-like point `x` coordinatewise onto `domain` while keeping its 
+type. If `x[d] < lb[d]`, then `lb[d]` is returned. If `x[d] > ub[d]`, then 
+`ub[d]` is returned. Otherwise, `x[d]` is kept.
+"""
 function project(domain::BoxDomain{D,T}, x) where {D,T}
     point = _point_tuple(T, x, D, "point")
-    return T[clamp(point[d], domain.lb[d], domain.ub[d]) for d in 1:D]
+    return T[
+        clamp(
+            point[d],
+            domain.lb[d],
+            domain.ub[d]
+        )
+        for d in 1:D 
+    ]
 end
+# ------------------------------------------------------------------------------
+"""
+    to_canonical(domain::BoxDomain{D,T}, x) where {D,T}
 
-"""Map a physical vector-like point to canonical coordinates in `[-1,1]^D`."""
+Map a physical vector-like point `x` to canonical coordinates in `[-1,1]^D` that
+works for many polynomials. Type of `x` is kept.
+"""
 function to_canonical(domain::BoxDomain{D,T}, x) where {D,T}
     point = _point_tuple(T, x, D, "point")
-    return T[(point[d] - domain.center[d]) * domain.invhalfwidth[d] for d in 1:D]
+    return T[
+        (point[d] - domain.center[d]) * domain.invhalfwidth[d]
+        for d in 1:D
+    ]
 end
+# ------------------------------------------------------------------------------
+"""
+    from_canonical(domain::BoxDomain{D,T}, xi) where {D,T}
 
-"""Map a length-`D` canonical vector-like point to physical coordinates."""
+Map a length-`D` canonical vector-like point to physical coordinates.
+Type of `xi` is kept.
+"""
 function from_canonical(domain::BoxDomain{D,T}, xi) where {D,T}
     point = _point_tuple(T, xi, D, "canonical point")
-    return T[domain.center[d] + domain.halfwidth[d] * point[d] for d in 1:D]
+    return T[
+        point[d] * domain.halfwidth[d] + domain.center[d]
+        for d in 1:D
+    ]
 end
 
-"""Draw one uniformly distributed point from `domain` using `rng`."""
+
+# RANDOM NUMBER DRAWING --------------------------------------------------------
+"""
+    Random.rand(rng::AbstractRNG, domain::BoxDomain{D,T}) where {D,T}
+
+Draw one uniformly distributed point from `domain` using `rng`. Returns a D-len
+vector of eltype `T`.
+"""
 function Random.rand(rng::AbstractRNG, domain::BoxDomain{D,T}) where {D,T}
-    return T[domain.lb[d] + rand(rng, T) *
-             (domain.ub[d] - domain.lb[d]) for d in 1:D]
+    return T[
+        domain.lb[d] + Δ * (domain.ub[d] - domain.lb[d])
+        for (d,Δ) in zip(1:D, rand(rng, D))
+    ]
 end
+# ------------------------------------------------------------------------------
+"""
+    Random.rand(domain::BoxDomain)
 
-"""Draw one uniformly distributed point using Julia's default RNG."""
+Draw one uniformly distributed point using Julia's default RNG.
+"""
 Random.rand(domain::BoxDomain) = rand(Random.default_rng(), domain)
+# ------------------------------------------------------------------------------
+"""
+    Random.rand(rng::AbstractRNG, domain::BoxDomain{D,T},n::Integer) where {D,T}
 
-"""Draw `n` uniform points as an `n`-by-`D` dense matrix."""
-function Random.rand(rng::AbstractRNG, domain::BoxDomain{D,T}, n::Integer) where {D,T}
-    n >= 0 || throw(ArgumentError("sample count must be nonnegative; received $n"))
-    points = Matrix{T}(undef, n, D)
-    for d in 1:D, i in 1:n
-        points[i, d] = domain.lb[d] + rand(rng, T) *
-                       (domain.ub[d] - domain.lb[d])
+Draw `n` uniform points as an `n`-by-`D` dense matrix of eltype `T`.
+"""
+function Random.rand(
+    rng   ::AbstractRNG, 
+    domain::BoxDomain{D,T}, 
+    n     ::Integer
+) where {D,T}
+    n >= 0 || throw(ArgumentError(
+        "sample count must be nonnegative; received $n"
+    ))
+    points = rand(rng, T, n, D)
+    @inbounds for d in 1:D
+        Δ   = domain.width[d]
+        lbd = domain.lb[d]
+        @simd for i in 1:n
+            points[i, d] = muladd(points[i, d], Δ, lbd)
+        end
     end
     return points
 end
+# ------------------------------------------------------------------------------
+"""
+    Random.rand(domain::BoxDomain, n::Integer)
 
-"""Draw `n` uniform point rows using Julia's default RNG."""
-Random.rand(domain::BoxDomain, n::Integer) = rand(Random.default_rng(), domain, n)
-
+Draw `n` uniform point rows using Julia's default RNG.
+"""
+Random.rand(domain::BoxDomain, n::Integer) = rand(Random.default_rng(),domain,n)
+# ------------------------------------------------------------------------------
 """
     sobol(domain, n)
 
@@ -176,34 +370,44 @@ Return the first `n` points of a deterministic Sobol low-discrepancy sequence,
 scaled to `domain`, as an `n`-by-`D` matrix.
 """
 function sobol(domain::BoxDomain{D,T}, n::Integer) where {D,T}
-    n >= 0 || throw(ArgumentError("sample count must be nonnegative; received $n"))
-    sequence = SobolSeq(D)
-    points = Matrix{T}(undef, n, D)
+    n >= 0 || throw(ArgumentError(
+        "sample count must be nonnegative; received $n"
+    ))
+    sequence  = SobolSeq(D)
+    points    = Matrix{T}(undef, n, D)
     workspace = Vector{Float64}(undef, D)
-    for i in 1:n
+    @inbounds for i in 1:n
         Sobol.next!(sequence, workspace)
-        for d in 1:D
-            points[i, d] = domain.lb[d] + T(workspace[d]) *
-                           (domain.ub[d] - domain.lb[d])
+        @simd for d in 1:D
+            points[i, d] = domain.lb[d] + T(workspace[d]) * domain.width[d]
         end
     end
     return points
 end
 
-function Base.show(io::IO, domain::BoxDomain{D,T}) where {D,T}
-    print(io, "BoxDomain{$D,$T}(")
-    for d in 1:D
-        d > 1 && print(io, ", ")
-        print(io, "[", domain.lb[d], ", ", domain.ub[d], "]")
-    end
-    print(io, ")")
-end
 
-# ------------------------------------------------------------------------------
-# Nested real Leja rule and sparse grid
-# ------------------------------------------------------------------------------
 
-"""Evaluate the logarithm of the Leja product at `x`."""
+
+
+
+
+
+
+
+
+
+
+
+# ==============================================================================
+# Nested real Leja rule
+# ==============================================================================
+"""
+    _leja_log_product(x::T, nodes::Vector{T}) where {T<:AbstractFloat}
+
+INTERNAL METHOD.
+
+Evaluate the logarithm of the Leja product at `x`.
+"""
 function _leja_log_product(x::T, nodes::Vector{T}) where {T<:AbstractFloat}
     total = zero(T)
     for node in nodes
@@ -213,9 +417,11 @@ function _leja_log_product(x::T, nodes::Vector{T}) where {T<:AbstractFloat}
     end
     return total
 end
-
+# ------------------------------------------------------------------------------
 """
     _leja_nodes(T, n)
+
+INTERNAL METHOD.
 
 Generate `n` nested real Leja nodes on `[-1,1]`, beginning at zero. At every
 step this routine maximizes the product of distances from earlier nodes. The
@@ -224,19 +430,30 @@ point is found by bisection. Equal maxima are resolved toward the smaller
 coordinate. This defines deterministic ordering without a discretization grid.
 """
 function _leja_nodes(::Type{T}, n::Int) where {T<:AbstractFloat}
+    
     n >= 1 || throw(ArgumentError("at least one Leja node is required"))
+    
     nodes = T[zero(T)]
+    
     tolerance = eps(T) * T(64)
+    
     while length(nodes) < n
+        
         ordered = sort(nodes)
+        
         candidates = T[]
+        
         !any(==(-one(T)), nodes) && push!(candidates, -one(T))
         !any(==(one(T)), nodes) && push!(candidates, one(T))
+        
         for j in 1:(length(ordered) - 1)
-            left = ordered[j]
+            
+            left  = ordered[j]
             right = ordered[j + 1]
+            
             lo = nextfloat(left)
             hi = prevfloat(right)
+            
             for _ in 1:80
                 mid = (lo + hi) / T(2)
                 derivative = zero(T)
@@ -251,75 +468,171 @@ function _leja_nodes(::Type{T}, n::Int) where {T<:AbstractFloat}
             end
             push!(candidates, (lo + hi) / T(2))
         end
+        
         best = candidates[1]
+        
         best_value = _leja_log_product(best, nodes)
+        
         for candidate in @view candidates[2:end]
             value = _leja_log_product(candidate, nodes)
             scale = max(one(T), abs(best_value), abs(value))
             if value > best_value + tolerance * scale ||
-               (abs(value - best_value) <= tolerance * scale && candidate < best)
+               (abs(value - best_value) <= tolerance * scale && candidate<best)
                 best = candidate
                 best_value = value
             end
         end
+
         push!(nodes, best)
+
     end
+
     return nodes
 end
 
+
+
+
+
+
+
+
+
+
+
+
+
+# ==============================================================================
+# Sparse grid
+# ==============================================================================
 """
     SmolyakGrid(max_levels, level_budget, domain; rule=:leja)
 
 Materialize a nested sparse Leja grid. Levels are zero-based: multi-index
 `alpha` selects the `(alpha[d]+1)`-st one-dimensional Leja node in coordinate
-`d`. The admissible set is
-`sum(alpha) <= level_budget` and `alpha[d] <= max_levels[d]`.
-Rows of `nodes` are physical points and follow total-degree/lexicographic order.
+`d`. The admissible set is `sum(alpha) <= level_budget` and 
+`alpha[d] <= max_levels[d]`. Rows of `nodes` are physical points and follow 
+total-degree/lexicographic order.
+
+## Usage Example
+```
+import SmolyakPoly as smx
+
+xspace = smx.BoxDomain([-1,-2,-3],[1,2,3])
+
+# construct & build the grid
+grid = smx.SmolyakGrid(
+    [5,6,7],      # coordinatewise max levels
+    5,            # level budget/threshold to truncate
+    xspace,       # domain
+    rule = :leja, # node creation rule
+)
+display(grid)
+
+smx.dimension(grid)
+length(grid)
+size(grid)
+
+# access multiindices and nodes
+grid.indices
+grid.nodes
+
+# access the underlying domain
+grid.domain
+
+# save to disk & recover
+# smx.save(grid, "grid.json")
+# grid = smx.BoxDomain("grid.json")
+```
 """
 struct SmolyakGrid{D,T<:AbstractFloat,Dom<:BoxDomain{D,T}}
-    domain::Dom
-    max_levels::NTuple{D,Int}
-    level_budget::Int
-    indices::Vector{MultiIndex{D}}
-    nodes::Matrix{T}
-    rule::Symbol
+    domain       ::Dom
+    max_levels   ::NTuple{D,Int}
+    level_budget ::Int
+    indices      ::Vector{MultiIndex{D}}
+    nodes        ::Matrix{T}
+    rule         ::Symbol
 end
-
-function SmolyakGrid(max_levels, level_budget::Integer,
-                     domain::BoxDomain{D,T}; rule::Symbol = :leja) where {D,T}
+# ------------------------------------------------------------------------------
+function Base.show(io::IO, grid::SmolyakGrid{D,T}) where {D,T}
+    print(io, 
+        "SmolyakGrid{$D,$T}(rule=", grid.rule,
+        ", nodes=", length(grid), 
+        ", level_budget=", grid.level_budget,
+        ", max_levels=", grid.max_levels, ")"
+    )
+end
+# ------------------------------------------------------------------------------
+function SmolyakGrid(
+    max_levels, 
+    level_budget::Integer,
+    domain      ::BoxDomain{D,T} ; 
+    rule        ::Symbol = :leja
+) where {D,T}
+    
     rule === :leja || throw(ArgumentError(
-        "unsupported node rule $rule; only :leja is available"))
-    levels = _point_tuple(Int, max_levels, D, "max_levels")
-    indices = _lower_indices(levels, Int(level_budget))
-    maximum_level = maximum(levels)
+        "unsupported node rule $rule; only :leja is available now."
+    ))
+    
+    levels          = _point_tuple(Int, max_levels, D, "max_levels")
+    indices         = _lower_indices(levels, Int(level_budget))
+    maximum_level   = maximum(levels)
     one_dimensional = _leja_nodes(T, maximum_level + 1)
+    
     nodes = Matrix{T}(undef, length(indices), D)
     for i in eachindex(indices), d in 1:D
         xi = one_dimensional[indices[i][d] + 1]
         nodes[i, d] = domain.center[d] + domain.halfwidth[d] * xi
     end
+    
     return SmolyakGrid{D,T,typeof(domain)}(
-        domain, levels, Int(level_budget), indices, nodes, rule)
+        domain, 
+        levels, 
+        Int(level_budget), 
+        indices, 
+        nodes, 
+        rule
+    )
 end
+# ------------------------------------------------------------------------------
+dimension(::SmolyakGrid{D}) where {D} = D
+Base.length(grid::SmolyakGrid)        = size(grid.nodes, 1)
+Base.size(grid::SmolyakGrid)          = size(grid.nodes)
+# ------------------------------------------------------------------------------
+"""
+    SmolyakGrid(path::AbstractString)    
 
-"""Load a `SmolyakGrid` from a versioned JSON file written by [`save`](@ref)."""
+Load a `SmolyakGrid` from a versioned JSON file written by [`save`](@ref).
+"""
 SmolyakGrid(path::AbstractString) = _load_grid(_read_json(path))
 
-"""Return the state-space dimension of `grid`."""
-dimension(::SmolyakGrid{D}) where {D} = D
-Base.length(grid::SmolyakGrid) = size(grid.nodes, 1)
-Base.size(grid::SmolyakGrid) = size(grid.nodes)
 
-function Base.show(io::IO, grid::SmolyakGrid{D,T}) where {D,T}
-    print(io, "SmolyakGrid{$D,$T}(rule=", grid.rule,
-          ", nodes=", length(grid), ", level_budget=", grid.level_budget,
-          ", max_levels=", grid.max_levels, ")")
-end
 
-# ------------------------------------------------------------------------------
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+# ==============================================================================
 # Chebyshev basis
-# ------------------------------------------------------------------------------
-
+# ==============================================================================
 """
     ChebyshevBasisSpec(max_orders, order_budget)
 
@@ -328,33 +641,48 @@ obey `sum(alpha) <= order_budget` and `alpha[d] <= max_orders[d]`, independently
 of any grid. Ordering is total degree followed by lexicographic order.
 """
 struct ChebyshevBasisSpec{D}
-    max_orders::NTuple{D,Int}
-    order_budget::Int
-    indices::Vector{MultiIndex{D}}
+    max_orders   ::NTuple{D,Int}
+    order_budget ::Int
+    indices      ::Vector{MultiIndex{D}}
 end
-
+# ------------------------------------------------------------------------------
+function Base.show(io::IO, basis::ChebyshevBasisSpec{D}) where {D}
+    print(io, 
+        "ChebyshevBasisSpec{$D}(terms=", length(basis),
+        ", order_budget=", basis.order_budget,
+        ", max_orders=", basis.max_orders, ")"
+    )
+end
+# ------------------------------------------------------------------------------
 function ChebyshevBasisSpec(max_orders, order_budget::Integer)
     D = length(max_orders)
     D >= 1 || throw(ArgumentError("a basis must have at least one dimension"))
-    orders = _point_tuple(Int, max_orders, D, "max_orders")
+    
+    orders  = _point_tuple(Int, max_orders, D, "max_orders")
     indices = _lower_indices(orders, Int(order_budget))
+    
     return ChebyshevBasisSpec{D}(orders, Int(order_budget), indices)
 end
 
-"""Load a basis specification from versioned JSON written by [`save`](@ref)."""
-ChebyshevBasisSpec(path::AbstractString) = _load_basis(_read_json(path))
-
-"""Return the state-space dimension of `basis`."""
+# BASE OVERLOADS ---------------------------------------------------------------
 dimension(::ChebyshevBasisSpec{D}) where {D} = D
 Base.length(basis::ChebyshevBasisSpec) = length(basis.indices)
 
-function Base.show(io::IO, basis::ChebyshevBasisSpec{D}) where {D}
-    print(io, "ChebyshevBasisSpec{$D}(terms=", length(basis),
-          ", order_budget=", basis.order_budget,
-          ", max_orders=", basis.max_orders, ")")
-end
+# DISK IO ----------------------------------------------------------------------
+"""
+    ChebyshevBasisSpec(path::AbstractString)
 
-"""Evaluate Chebyshev polynomial `T_order(x)` by the stable three-term recurrence."""
+Load a basis specification from versioned JSON written by [`save`](@ref).
+"""
+ChebyshevBasisSpec(path::AbstractString) = _load_basis(_read_json(path))
+
+# MATH OPERATIONS --------------------------------------------------------------
+"""
+    _chebyshev_value(order::Int, x::T) where {T}
+        
+INTERNAL METHOD.
+Evaluate Chebyshev polynomial `T_order(x)` by the stable three-term recurrence.
+"""
 @inline function _chebyshev_value(order::Int, x::T) where {T}
     order == 0 && return one(T)
     order == 1 && return x
@@ -362,15 +690,16 @@ end
     current = x
     for _ in 2:order
         following = muladd(T(2) * x, current, -previous)
-        previous = current
-        current = following
+        previous  = current
+        current   = following
     end
     return current
 end
-
+# ------------------------------------------------------------------------------
 """
     _chebyshev_value_derivatives(order, x)
 
+INTERNAL METHOD.
 Evaluate `T_order(x)` and its first two derivatives with respect to canonical
 coordinate `x`. Differentiating the three-term Chebyshev recurrence avoids
 division near roots and endpoints and returns a type-stable three-tuple.
@@ -387,30 +716,43 @@ division near roots and endpoints and returns a type-stable three-tuple.
     second = zero(T)
 
     for _ in 2:order
-        following_value = muladd(T(2) * x, value, -previous_value)
-        following_first = T(2) * value + T(2) * x * first - previous_first
+        following_value  = muladd(T(2) * x, value, -previous_value)
+        following_first  = T(2) * value + T(2) * x * first - previous_first
         following_second = T(4) * first + T(2) * x * second - previous_second
-        previous_value = value
-        value = following_value
-        previous_first = first
-        first = following_first
-        previous_second = second
-        second = following_second
+        previous_value   = value
+        value            = following_value
+        previous_first   = first
+        first            = following_first
+        previous_second  = second
+        second           = following_second
     end
     return (value, first, second)
 end
+# ------------------------------------------------------------------------------
+"""
+    _validate_point(domain::BoxDomain{D}, x) where {D}
 
-"""Check the shape and membership of one point, throwing a domain-specific error."""
+INTERNAL METHOD.
+Check the shape and membership of one point, throwing a domain-specific error if
+violation found.
+"""
 function _validate_point(domain::BoxDomain{D}, x) where {D}
     length(x) == D || throw(DimensionMismatch(
-        "point must have length $D; received length $(length(x))"))
+        "point must have length $D; received length $(length(x))"
+    ))
     x in domain || throw(DomainError(x,
         "point lies outside the approximation domain; use project(domain, x) " *
-        "explicitly if projection is intended"))
+        "explicitly if projection is intended"
+    ))
     return nothing
 end
+# ------------------------------------------------------------------------------
+"""
+    _validate_points(domain::BoxDomain{D}, X::AbstractMatrix) where {D}
 
-"""Check an `N`-by-`D` point matrix and verify every row is in `domain`."""
+INTERNAL METHOD.
+Check an `N`-by-`D` point matrix and verify every row is in `domain`.
+"""
 function _validate_points(domain::BoxDomain{D}, X::AbstractMatrix) where {D}
     size(X, 2) == D || throw(DimensionMismatch(
         "batch input must have $D columns; received size $(size(X))"))
@@ -420,10 +762,19 @@ function _validate_points(domain::BoxDomain{D}, X::AbstractMatrix) where {D}
     end
     return nothing
 end
+# ------------------------------------------------------------------------------
+"""
+    _term_value(::Type{T},domain::BoxDomain{D},alpha,x) where {T,D}
 
-"""Evaluate one tensor-product term using physical coordinates."""
-@inline function _term_value(::Type{T}, domain::BoxDomain{D}, alpha,
-                             x) where {T,D}
+INTERNAL METHOD.
+Evaluate one tensor-product term using physical coordinates.
+"""
+@inline function _term_value(
+    ::Type{T}, 
+    domain::BoxDomain{D}, 
+    alpha,
+    x
+) where {T,D}
     value = one(T)
     for d in 1:D
         xi = (T(x[d]) - T(domain.center[d])) * T(domain.invhalfwidth[d])
@@ -432,10 +783,35 @@ end
     return value
 end
 
-# ------------------------------------------------------------------------------
-# Fit plan
-# ------------------------------------------------------------------------------
 
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+# ==============================================================================
+# Fit plan
+# ==============================================================================
 """
     FitPlan(grid, basis; ridge_lambda=0.0, solver=:qr)
 
@@ -445,55 +821,102 @@ fits. Ridge regression uses QR on the augmented system
 rank-deficient systems are also rejected with an informative error.
 """
 struct FitPlan{D,T,G,B,F}
-    grid::G
-    basis::B
-    canonical_nodes::Matrix{T}
-    design::Matrix{T}
-    factorization::F
-    system_type::Symbol
-    solver::Symbol
-    ridge_lambda::T
+    grid            ::G
+    basis           ::B
+    canonical_nodes ::Matrix{T}
+    design          ::Matrix{T}
+    factorization   ::F
+    system_type     ::Symbol
+    solver          ::Symbol
+    ridge_lambda    ::T
 end
+# ------------------------------------------------------------------------------
+function Base.show(io::IO, plan::FitPlan)
+    print(io, 
+        "FitPlan(nodes=", length(plan.grid), 
+        ", terms=", length(plan.basis),
+        ", system=", plan.system_type, 
+        ", solver=", plan.solver,
+        ", ridge_lambda=", plan.ridge_lambda, 
+        ", factorization=cached)"
+    )
+end
+# ------------------------------------------------------------------------------
+function FitPlan(
+    grid         ::SmolyakGrid{D}, 
+    basis        ::ChebyshevBasisSpec{D2} ;
+    ridge_lambda ::Real = 0.0, 
+    solver       ::Symbol = :qr
+) where {D,D2}
 
-function FitPlan(grid::SmolyakGrid{D}, basis::ChebyshevBasisSpec{D2};
-                 ridge_lambda::Real = 0.0, solver::Symbol = :qr) where {D,D2}
     D == D2 || throw(DimensionMismatch(
-        "grid dimension $D does not match basis dimension $D2"))
+        "grid dimension $D does not match basis dimension $D2"
+    ))
     solver === :qr || throw(ArgumentError(
-        "unsupported solver $solver; only :qr is available"))
+        "unsupported solver $solver; only :qr is available for now"
+    ))
     isfinite(ridge_lambda) && ridge_lambda >= 0 || throw(ArgumentError(
-        "ridge_lambda must be finite and nonnegative; received $ridge_lambda"))
+        "ridge_lambda must be finite and nonnegative; received $ridge_lambda"
+    ))
+    
     node_count = length(grid)
     term_count = length(basis)
     node_count >= term_count || throw(ArgumentError(
         "underdetermined fitting system: $node_count nodes for $term_count " *
-        "basis terms; reduce the basis or enlarge the grid"))
+        "basis terms; reduce the basis or enlarge the grid"
+    ))
+    
     T = Float64
-    canonical = Matrix{T}(undef, node_count, D)
+    canonical = Matrix{T}(undef, node_count, D) # transformed points in [-1,1]^n
+    
     for i in 1:node_count, d in 1:D
-        canonical[i, d] = (T(grid.nodes[i, d]) - T(grid.domain.center[d])) *
-                          T(grid.domain.invhalfwidth[d])
+        canonical[i, d] = (
+            T(grid.nodes[i, d]) - T(grid.domain.center[d])
+        ) * T(grid.domain.invhalfwidth[d])
     end
+
     design = _basis_matrix_canonical(T, basis, canonical)
     lambda = T(ridge_lambda)
+    
     if iszero(lambda)
         matrix_rank = rank(design)
         matrix_rank == term_count || throw(ArgumentError(
             "fitting design is rank deficient: rank $matrix_rank for " *
-            "$term_count basis terms; change the grid or use positive ridge_lambda"))
+            "$term_count basis terms; change the grid or use positive ridge"
+        ))
         factorization = qr(design, ColumnNorm())
     else
-        augmented = [design; sqrt(lambda) * Matrix{T}(I, term_count, term_count)]
+        augmented = [design; sqrt(lambda) * Matrix{T}(I,term_count,term_count)]
         factorization = qr(augmented, ColumnNorm())
     end
     system_type = node_count == term_count ? :square : :overdetermined
+    
     return FitPlan{D,T,typeof(grid),typeof(basis),typeof(factorization)}(
-        grid, basis, canonical, design, factorization, system_type, solver, lambda)
+        grid, 
+        basis, 
+        canonical, 
+        design, 
+        factorization, 
+        system_type, 
+        solver, 
+        lambda
+    )
 end
-
-"""Build a basis matrix from canonical point rows without domain validation."""
-function _basis_matrix_canonical(::Type{T}, basis::ChebyshevBasisSpec{D},
-                                 canonical::AbstractMatrix) where {T,D}
+# ------------------------------------------------------------------------------
+"""
+    _basis_matrix_canonical(
+        ::Type{T}, 
+        basis    ::ChebyshevBasisSpec{D},
+        canonical::AbstractMatrix
+    )
+INTERNAL METHOD.
+Build a basis matrix from canonical point rows without domain validation.
+"""
+function _basis_matrix_canonical(
+    ::Type{T}, 
+    basis    ::ChebyshevBasisSpec{D},
+    canonical::AbstractMatrix
+) where {T,D}
     matrix = Matrix{T}(undef, size(canonical, 1), length(basis))
     for i in axes(canonical, 1), k in eachindex(basis.indices)
         value = one(T)
@@ -506,16 +929,80 @@ function _basis_matrix_canonical(::Type{T}, basis::ChebyshevBasisSpec{D},
     return matrix
 end
 
-function Base.show(io::IO, plan::FitPlan)
-    print(io, "FitPlan(nodes=", length(plan.grid), ", terms=", length(plan.basis),
-          ", system=", plan.system_type, ", solver=", plan.solver,
-          ", ridge_lambda=", plan.ridge_lambda, ", factorization=cached)")
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+# ==============================================================================
+# fitted approximation and fitting
+# ==============================================================================
+"""
+    SmolyakApproximation
+
+A mutable, scalar-valued fitted polynomial. It stores persistent mathematical
+state and diagnostics only; prepared CPU/GPU runtime buffers are separate.
+
+Instances are constructed using `fit()`. No direct construction suggested.
+"""
+mutable struct SmolyakApproximation{D,T<:AbstractFloat,Dom,G,B}
+    domain         ::Dom
+    grid           ::G
+    basis          ::B
+    coeffs         ::Vector{T}
+    system_type    ::Symbol
+    solver         ::Symbol
+    ridge_lambda   ::T
+    node_rmse      ::T
+    max_node_error ::T
 end
-
 # ------------------------------------------------------------------------------
-# Node evaluation and fitted approximation
+function Base.show(io::IO, res::SmolyakApproximation{D,T}) where {D,T}
+    print(io, 
+        "SmolyakApproximation{$D,$T}(nodes=", length(res.grid),
+        ", coefficients=", length(res.coeffs), 
+        ", system=", res.system_type,
+        ", solver=", res.solver, 
+        ", ridge_lambda=", res.ridge_lambda,
+        ", node_rmse=", res.node_rmse,
+        ", max_node_error=", res.max_node_error, ")"
+    )
+end
 # ------------------------------------------------------------------------------
+dimension(::SmolyakApproximation{D}) where {D} = D
+# ------------------------------------------------------------------------------
+"""
+    coefficients(res::SmolyakApproximation)
 
+Return the canonical coefficient vector stored by `res` without copying it.
+"""
+coefficients(res::SmolyakApproximation) = res.coeffs
+
+# DISK IO ----------------------------------------------------------------------
+"""Load a fitted approximation from versioned JSON written by [`save`](@ref)."""
+SmolyakApproximation(path::AbstractString)=_load_approximation(_read_json(path))
+
+# FITTING ----------------------------------------------------------------------
 """
     evaluate_nodes(fun, grid; multi_threading=false, verbose=true)
 
@@ -523,16 +1010,27 @@ Call arbitrary callable `fun` once for each grid row. Each call receives a
 vector-like row view. The result is a dense floating vector. With threading,
 the first value is evaluated once to establish the output type and remaining
 rows are distributed using `Threads.@threads`.
+
+This function is a lower level API that works well for expensive target function
+evaluations.
 """
-function evaluate_nodes(fun, grid::SmolyakGrid;
-                        multi_threading::Bool = false, verbose::Bool = true)
-    count = length(grid)
+function evaluate_nodes(
+    fun, 
+    grid::SmolyakGrid;
+    multi_threading::Bool = false, 
+    verbose::Bool = true
+)
+    count       = length(grid)
     first_value = float(fun(@view grid.nodes[1, :]))
-    T = typeof(first_value)
+    T           = typeof(first_value)
+    
     T <: AbstractFloat || throw(ArgumentError(
-        "node function values must convert to a floating scalar; received $T"))
-    values = Vector{T}(undef, count)
+        "node function values must convert to a floating scalar; received $T"
+    ))
+    
+    values    = Vector{T}(undef, count)
     values[1] = first_value
+
     if multi_threading && count > 1
         Threads.@threads for i in 2:count
             values[i] = fun(@view grid.nodes[i, :])
@@ -542,50 +1040,35 @@ function evaluate_nodes(fun, grid::SmolyakGrid;
             values[i] = fun(@view grid.nodes[i, :])
         end
     end
+    
     verbose && println("Evaluated $count sparse-grid nodes.")
     return values
 end
-
+# ------------------------------------------------------------------------------
 """
-    SmolyakApproximation
+    _solve(plan::FitPlan{D,T}, values) where {D,T}
 
-A mutable, scalar-valued fitted polynomial. It stores persistent mathematical
-state and diagnostics only; prepared CPU/GPU runtime buffers are separate.
+INTERNAL METHOD.
+Solve a cached fitting system for a validated floating right-hand side.
 """
-mutable struct SmolyakApproximation{D,T<:AbstractFloat,Dom,G,B}
-    domain::Dom
-    grid::G
-    basis::B
-    coeffs::Vector{T}
-    system_type::Symbol
-    solver::Symbol
-    ridge_lambda::T
-    node_rmse::T
-    max_node_error::T
-end
-
-"""Load a fitted approximation from versioned JSON written by [`save`](@ref)."""
-SmolyakApproximation(path::AbstractString) = _load_approximation(_read_json(path))
-
-"""Return the state-space dimension of a fitted approximation."""
-dimension(::SmolyakApproximation{D}) where {D} = D
-
-"""Return the canonical coefficient vector stored by `res` without copying it."""
-coefficients(res::SmolyakApproximation) = res.coeffs
-
-"""Solve a cached fitting system for a validated floating right-hand side."""
 function _solve(plan::FitPlan{D,T}, values) where {D,T}
     length(values) == length(plan.grid) || throw(DimensionMismatch(
-        "expected $(length(plan.grid)) node values; received $(length(values))"))
+        "expected $(length(plan.grid)) node values; received $(length(values))"
+    ))
+    
     y = T.(values)
     all(isfinite, y) || throw(ArgumentError("all node values must be finite"))
+    
     if iszero(plan.ridge_lambda)
         return Vector{T}(plan.factorization \ y), y
     end
+    
     rhs = [y; zeros(T, length(plan.basis))]
+    
+    # QR solve
     return Vector{T}(plan.factorization \ rhs), y
 end
-
+# ------------------------------------------------------------------------------
 """
     fit(plan, node_values; verbose=true)
 
@@ -593,164 +1076,258 @@ Fit coefficients using the cached plan and return a new approximation with
 empirical node RMSE and maximum absolute residual diagnostics.
 """
 function fit(plan::FitPlan{D,T}, node_values; verbose::Bool = true) where {D,T}
+    
+    # solve the coefs
     coeffs, y = _solve(plan, node_values)
-    residual = plan.design * coeffs - y
-    rmse = sqrt(sum(abs2, residual) / length(residual))
+    
+    # fitting goodness
+    residual  = plan.design * coeffs - y
+    rmse      = sqrt(sum(abs2, residual) / length(residual))
     max_error = maximum(abs, residual)
-    result = SmolyakApproximation{D,T,typeof(plan.grid.domain),
-        typeof(plan.grid),typeof(plan.basis)}(
-        plan.grid.domain, plan.grid, plan.basis, coeffs, plan.system_type,
-        plan.solver, plan.ridge_lambda, rmse, max_error)
-    verbose && println("Fitted $(length(coeffs)) coefficients; node RMSE = $rmse.")
+    
+    result = SmolyakApproximation{
+        D,T,typeof(plan.grid.domain),
+        typeof(plan.grid),typeof(plan.basis)
+    }(
+        plan.grid.domain, 
+        plan.grid, 
+        plan.basis, 
+        coeffs, 
+        plan.system_type,
+        plan.solver, 
+        plan.ridge_lambda, 
+        rmse, 
+        max_error
+    )
+    
+    verbose && println(
+        "Fitted $(length(coeffs)) coefficients; node RMSE = $rmse."
+    )
     return result
 end
-
+# ------------------------------------------------------------------------------
 """
     fit(fun, plan; multi_threading=false, verbose=true)
 
 Convenience route equivalent to [`evaluate_nodes`](@ref) followed by
 `fit(plan, values)`.
+
+Use this function primarily unless necessary.
 """
-function fit(fun, plan::FitPlan; multi_threading::Bool = false,
-             verbose::Bool = true)
-    values = evaluate_nodes(fun, plan.grid;
-                            multi_threading = multi_threading, verbose = verbose)
+function fit(
+    fun, 
+    plan           ::FitPlan; 
+    multi_threading::Bool = false,
+    verbose        ::Bool = true)
+    values = evaluate_nodes(
+        fun, 
+        plan.grid;
+        multi_threading = multi_threading, 
+        verbose = verbose
+    )
     return fit(plan, values; verbose = verbose)
 end
+# ------------------------------------------------------------------------------
+"""
+    _compatible(res::SmolyakApproximation, plan::FitPlan)
 
-"""Return whether a result and plan describe exactly the same grid and basis."""
+INTERNAL METHOD.
+Return whether a result and plan describe exactly the same grid and basis.
+"""
 function _compatible(res::SmolyakApproximation, plan::FitPlan)
-    return dimension(res) == dimension(plan.grid) &&
-           res.grid.max_levels == plan.grid.max_levels &&
-           res.grid.level_budget == plan.grid.level_budget &&
-           res.grid.nodes == plan.grid.nodes &&
-           res.basis.max_orders == plan.basis.max_orders &&
-           res.basis.order_budget == plan.basis.order_budget &&
-           res.basis.indices == plan.basis.indices
+    return dimension(res)      == dimension(plan.grid)    &&
+        res.grid.max_levels    == plan.grid.max_levels    &&
+        res.grid.level_budget  == plan.grid.level_budget  &&
+        res.grid.nodes         == plan.grid.nodes         &&
+        res.basis.max_orders   == plan.basis.max_orders   &&
+        res.basis.order_budget == plan.basis.order_budget &&
+        res.basis.indices      == plan.basis.indices
 end
-
+# ------------------------------------------------------------------------------
 """
     fit!(res, plan, new_node_values; verbose=true)
 
 Refit a structurally compatible approximation in place using the cached
 factorization. Coefficients and diagnostics are updated; grid and basis are not.
+
+This function is recommended in scenarios of iterative algorithm in which the
+approximation object needs to be updated for multiple times.
 """
-function fit!(res::SmolyakApproximation{D,T}, plan::FitPlan,
-              new_node_values; verbose::Bool = true) where {D,T}
+function fit!(
+    res ::SmolyakApproximation{D,T}, 
+    plan::FitPlan,
+    new_node_values; 
+    verbose::Bool = true
+) where {D,T}
     _compatible(res, plan) || throw(ArgumentError(
-        "approximation and fit plan have incompatible grid or basis structure"))
+        "approximation and fit plan have incompatible grid or basis structure"
+    ))
     eltype(plan.design) === T || throw(ArgumentError(
-        "approximation coefficient type $T differs from plan type $(eltype(plan.design))"))
+        "approximation coefficient type $T " *
+        "differs from plan type $(eltype(plan.design))"
+    ))
+
     coeffs, y = _solve(plan, new_node_values)
     copyto!(res.coeffs, coeffs)
-    residual = plan.design * coeffs - y
-    res.node_rmse = sqrt(sum(abs2, residual) / length(residual))
+    
+    residual           = plan.design * coeffs - y
+    res.node_rmse      = sqrt(sum(abs2, residual) / length(residual))
     res.max_node_error = maximum(abs, residual)
-    res.system_type = plan.system_type
-    res.solver = plan.solver
+
+    res.system_type  = plan.system_type
+    res.solver       = plan.solver
     res.ridge_lambda = plan.ridge_lambda
-    verbose && println("Refitted $(length(coeffs)) coefficients; node RMSE = " *
-                       "$(res.node_rmse).")
+    
+    verbose && println(
+        "Refitted $(length(coeffs)) coefficients; node RMSE = " *
+        "$(res.node_rmse)."
+    )
     return res
 end
 
-function Base.show(io::IO, res::SmolyakApproximation{D,T}) where {D,T}
-    print(io, "SmolyakApproximation{$D,$T}(nodes=", length(res.grid),
-          ", coefficients=", length(res.coeffs), ", system=", res.system_type,
-          ", solver=", res.solver, ", ridge_lambda=", res.ridge_lambda,
-          ", node_rmse=", res.node_rmse,
-          ", max_node_error=", res.max_node_error, ")")
-end
 
-# ------------------------------------------------------------------------------
-# CPU evaluation and explicit basis diagnostics
-# ------------------------------------------------------------------------------
 
-"""Fused single-point coefficient accumulation without a basis-vector allocation."""
-function _evaluate_point(::Type{T}, domain::BoxDomain{D}, indices,
-                         coeffs, x) where {T,D}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+# ==============================================================================
+# CPU evaluation
+# ==============================================================================
+"""
+    _evaluate_point(::Type{T},domain::BoxDomain{D},indices,coeffs,x) where {T,D}
+
+INTERNAL METHOD.
+Fused single-point coefficient accumulation without a basis-vector allocation.
+Works on CPU.
+"""
+function _evaluate_point(
+    ::Type{T}, 
+    domain::BoxDomain{D}, 
+    indices,
+    coeffs, 
+    x
+) where {T,D}
     total = zero(T)
     for k in eachindex(indices)
-        total = muladd(T(coeffs[k]), _term_value(T, domain, indices[k], x), total)
+        total = muladd(T(coeffs[k]), _term_value(T,domain,indices[k], x), total)
     end
     return total
 end
+# ------------------------------------------------------------------------------
+"""
+    (res::SmolyakApproximation{D,T})(x::AbstractVector) where {D,T}
 
-"""Evaluate `res` at one physical point using its coefficient precision."""
+Evaluate `res` at one physical point using its coefficient precision.
+"""
 function (res::SmolyakApproximation{D,T})(x::AbstractVector) where {D,T}
     _validate_point(res.domain, x)
     return _evaluate_point(T, res.domain, res.basis.indices, res.coeffs, x)
 end
+# ------------------------------------------------------------------------------
+"""
+    (res::SmolyakApproximation{D,T})(X::AbstractMatrix) where {D,T}
 
-"""Evaluate `res` at point rows in `X`, returning one value per row."""
+Evaluate `res` at point rows in `X`, returning one value per row.
+"""
 function (res::SmolyakApproximation{D,T})(X::AbstractMatrix) where {D,T}
     _validate_points(res.domain, X)
     output = Vector{T}(undef, size(X, 1))
     for i in axes(X, 1)
-        output[i] = _evaluate_point(T, res.domain, res.basis.indices,
-                                    res.coeffs, @view X[i, :])
+        output[i] = _evaluate_point(
+            T, 
+            res.domain, 
+            res.basis.indices,
+            res.coeffs, 
+            @view X[i, :]
+        )
     end
     return output
 end
+# ------------------------------------------------------------------------------
+"""
+    (res::SmolyakApproximation)(::Type{T}, x::AbstractVector)
 
-"""Evaluate one point explicitly in floating type `T`."""
-function (res::SmolyakApproximation)(::Type{T}, x::AbstractVector) where {T<:AbstractFloat}
+Evaluate one point explicitly in floating type `T`, where `T<:AbstractFloat`.
+"""
+function (res::SmolyakApproximation)(
+    ::Type{T}, 
+    x::AbstractVector
+) where {T<:AbstractFloat}
     _validate_point(res.domain, x)
     return _evaluate_point(T, res.domain, res.basis.indices, res.coeffs, x)
 end
+# ------------------------------------------------------------------------------
+"""
+    (res::SmolyakApproximation)(::Type{T}, X::AbstractMatrix)
 
-"""Evaluate a batch explicitly in floating type `T`."""
-function (res::SmolyakApproximation)(::Type{T}, X::AbstractMatrix) where {T<:AbstractFloat}
+Evaluate a batch explicitly in floating type `T`, where `T<:AbstractFloat`.
+"""
+function (res::SmolyakApproximation)(
+    ::Type{T}, 
+    X::AbstractMatrix
+) where {T<:AbstractFloat}
     _validate_points(res.domain, X)
     output = Vector{T}(undef, size(X, 1))
     for i in axes(X, 1)
-        output[i] = _evaluate_point(T, res.domain, res.basis.indices,
-                                    res.coeffs, @view X[i, :])
+        output[i] = _evaluate_point(
+            T, 
+            res.domain, 
+            res.basis.indices,
+            res.coeffs, 
+            @view X[i, :]
+        )
     end
     return output
 end
 
-"""Construct a CPU basis vector at one physical point."""
-basis_vector(res::SmolyakApproximation, x; backend::Symbol = :cpu) =
-    basis_vector(eltype(res.coeffs), res, x; backend = backend)
 
-"""Construct a basis vector in explicit precision `T`."""
-function basis_vector(::Type{T}, res::SmolyakApproximation, x;
-                      backend::Symbol = :cpu) where {T<:AbstractFloat}
-    if backend !== :cpu
-        return basis_vector(prepare(res; T = T, backend = backend), x)
-    end
-    _validate_point(res.domain, x)
-    vector = Vector{T}(undef, length(res.basis))
-    for k in eachindex(res.basis.indices)
-        vector[k] = _term_value(T, res.domain, res.basis.indices[k], x)
-    end
-    return vector
-end
 
-"""Construct a dense CPU basis matrix for physical point rows."""
-basis_matrix(res::SmolyakApproximation, X; backend::Symbol = :cpu) =
-    basis_matrix(eltype(res.coeffs), res, X; backend = backend)
 
-"""Construct an explicit-precision basis matrix for physical point rows."""
-function basis_matrix(::Type{T}, res::SmolyakApproximation{D}, X::AbstractMatrix;
-                      backend::Symbol = :cpu) where {T<:AbstractFloat,D}
-    if backend !== :cpu
-        return basis_matrix(prepare(res; T = T, backend = backend), X)
-    end
-    _validate_points(res.domain, X)
-    matrix = Matrix{T}(undef, size(X, 1), length(res.basis))
-    for i in axes(X, 1), k in eachindex(res.basis.indices)
-        matrix[i, k] = _term_value(T, res.domain, res.basis.indices[k],
-                                   @view X[i, :])
-    end
-    return matrix
-end
 
-# ------------------------------------------------------------------------------
-# Prepared evaluator and backend registry
-# ------------------------------------------------------------------------------
 
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+# ==============================================================================
+# Prepared CPU evaluator and backend registry
+# ==============================================================================
 """
     CPUPreparedEvaluator
 
@@ -758,12 +1335,16 @@ Backend-ready immutable CPU data. Coefficients, polynomial indices, and affine
 metadata are converted once by [`prepare`](@ref), then reused by calls.
 """
 struct CPUPreparedEvaluator{D,T<:AbstractFloat,Dom}
-    domain::Dom
-    coeffs::Vector{T}
-    indices::Matrix{Int}
+    domain  ::Dom
+    coeffs  ::Vector{T}
+    indices ::Matrix{Int}
 end
+# ------------------------------------------------------------------------------
+"""
+    (evaluator::CPUPreparedEvaluator{D,T})(x::AbstractVector) where {D,T}
 
-"""Evaluate one point with a prepared CPU evaluator."""
+Evaluate one point with a prepared CPU evaluator.
+"""
 function (evaluator::CPUPreparedEvaluator{D,T})(x::AbstractVector) where {D,T}
     _validate_point(evaluator.domain, x)
     total = zero(T)
@@ -778,8 +1359,12 @@ function (evaluator::CPUPreparedEvaluator{D,T})(x::AbstractVector) where {D,T}
     end
     return total
 end
+# ------------------------------------------------------------------------------
+"""
+    (evaluator::CPUPreparedEvaluator{D,T})(X::AbstractMatrix) where {D,T}
 
-"""Evaluate point rows with a prepared CPU evaluator."""
+Evaluate point rows with a prepared CPU evaluator.
+"""
 function (evaluator::CPUPreparedEvaluator{D,T})(X::AbstractMatrix) where {D,T}
     _validate_points(evaluator.domain, X)
     output = Vector{T}(undef, size(X, 1))
@@ -799,7 +1384,108 @@ function (evaluator::CPUPreparedEvaluator{D,T})(X::AbstractMatrix) where {D,T}
     return output
 end
 
-"""Construct a basis vector using a prepared CPU evaluator."""
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+# ==============================================================================
+# Explicit basis-coefficent language & diagnostics
+# ==============================================================================
+"""
+    basis_vector(res::SmolyakApproximation, x; backend::Symbol = :cpu)
+
+Construct a CPU basis vector at one physical point.
+"""
+basis_vector(res::SmolyakApproximation, x; backend::Symbol = :cpu) =
+    basis_vector(eltype(res.coeffs), res, x; backend = backend)
+# ------------------------------------------------------------------------------
+"""
+    basis_vector(::Type{T},res::SmolyakApproximation,x;backend::Symbol = :cpu)
+
+Construct a basis vector in explicit precision `T`, where `T<:AbstractFloat`.
+"""
+function basis_vector(
+    ::Type{T}, 
+    res::SmolyakApproximation, 
+    x;
+    backend::Symbol = :cpu
+) where {T<:AbstractFloat}
+
+    if backend !== :cpu
+        # GPU case, prepare an evaluator and evaluate
+        return basis_vector(prepare(res; T = T, backend = backend), x)
+    end
+
+    _validate_point(res.domain, x)
+    vector = Vector{T}(undef, length(res.basis))
+    
+    for k in eachindex(res.basis.indices)
+        vector[k] = _term_value(T, res.domain, res.basis.indices[k], x)
+    end
+
+    return vector
+end
+# ------------------------------------------------------------------------------
+"""
+    basis_matrix(res::SmolyakApproximation, X; backend::Symbol = :cpu)
+
+Construct a dense CPU basis matrix for physical point rows.
+"""
+basis_matrix(res::SmolyakApproximation, X; backend::Symbol = :cpu) =
+    basis_matrix(eltype(res.coeffs), res, X; backend = backend)
+# ------------------------------------------------------------------------------
+"""
+    basis_matrix(::Type{T}, res::SmolyakApproximation{D}, X::AbstractMatrix; 
+backend::Symbol = :cpu) 
+
+Construct an explicit-precision basis matrix for physical point rows, where `
+T<:AbstractFloat`.
+"""
+function basis_matrix(
+    ::Type{T}, 
+    res::SmolyakApproximation{D}, 
+    X::AbstractMatrix;
+    backend::Symbol = :cpu
+) where {T<:AbstractFloat,D}
+    if backend !== :cpu
+        return basis_matrix(prepare(res; T = T, backend = backend), X)
+    end
+
+    _validate_points(res.domain, X)
+
+    matrix = Matrix{T}(undef, size(X, 1), length(res.basis))
+
+    for i in axes(X, 1), k in eachindex(res.basis.indices)
+        matrix[i, k] = _term_value(
+            T, 
+            res.domain, 
+            res.basis.indices[k],
+            @view X[i, :]
+        )
+    end
+
+    return matrix
+end
+# ------------------------------------------------------------------------------
+"""
+    basis_vector(evaluator::CPUPreparedEvaluator{D,T}, x) where {D,T}
+Construct a basis vector using a prepared CPU evaluator.
+"""
 function basis_vector(evaluator::CPUPreparedEvaluator{D,T}, x) where {D,T}
     _validate_point(evaluator.domain, x)
     result = Vector{T}(undef, size(evaluator.indices, 1))
@@ -814,9 +1500,16 @@ function basis_vector(evaluator::CPUPreparedEvaluator{D,T}, x) where {D,T}
     end
     return result
 end
+# ------------------------------------------------------------------------------
+"""
+    basis_matrix(evaluator::CPUPreparedEvaluator{D,T}, X::AbstractMatrix)
 
-"""Construct a basis matrix using a prepared CPU evaluator."""
-function basis_matrix(evaluator::CPUPreparedEvaluator{D,T}, X::AbstractMatrix) where {D,T}
+Construct a basis matrix using a prepared CPU evaluator.
+"""
+function basis_matrix(
+    evaluator::CPUPreparedEvaluator{D,T}, 
+    X::AbstractMatrix
+) where {D,T}
     _validate_points(evaluator.domain, X)
     result = Matrix{T}(undef, size(X, 1), size(evaluator.indices, 1))
     for i in axes(X, 1), k in axes(evaluator.indices, 1)
@@ -831,10 +1524,26 @@ function basis_matrix(evaluator::CPUPreparedEvaluator{D,T}, X::AbstractMatrix) w
     return result
 end
 
-# ------------------------------------------------------------------------------
-# Prepared gradient and Hessian evaluators
-# ------------------------------------------------------------------------------
 
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+# ==============================================================================
+# Prepared CPU gradient and Hessian evaluators
+# ==============================================================================
 """
     CPUGradientEvaluator
 
@@ -843,11 +1552,11 @@ one point return `Vector{T}`; calls on `N` point rows return `Matrix{T}` of size
 `N × D`.
 """
 struct CPUGradientEvaluator{D,T<:AbstractFloat,Dom}
-    domain::Dom
-    coeffs::Vector{T}
-    indices::Matrix{Int}
+    domain  ::Dom
+    coeffs  ::Vector{T}
+    indices ::Matrix{Int}
 end
-
+# ------------------------------------------------------------------------------
 """
     CPUHessianEvaluator
 
@@ -856,12 +1565,17 @@ one point return a `D × D` matrix. Calls on `N` point rows return a vector of
 `N` such matrices.
 """
 struct CPUHessianEvaluator{D,T<:AbstractFloat,Dom}
-    domain::Dom
-    coeffs::Vector{T}
-    indices::Matrix{Int}
+    domain  ::Dom
+    coeffs  ::Vector{T}
+    indices ::Matrix{Int}
 end
+# ------------------------------------------------------------------------------
+"""
+    _fill_product_sides!(prefix, suffix, values, D::Int)
 
-"""Fill prefix and suffix products for one tensor-product basis term."""
+INTERNAL METHOD. Fill prefix and suffix products for one tensor-product 
+basis term.
+"""
 @inline function _fill_product_sides!(prefix, suffix, values, D::Int)
     prefix[1] = one(eltype(prefix))
     for d in 1:D
@@ -873,10 +1587,23 @@ end
     end
     return nothing
 end
+# ------------------------------------------------------------------------------
+"""
+    _gradient_point!(output, evaluator::CPUGradientEvaluator{D,T}, x, values, 
+firsts, prefix, suffix) where {D,T}
 
-"""Fill a physical-coordinate gradient without allocating term vectors."""
-function _gradient_point!(output, evaluator::CPUGradientEvaluator{D,T}, x,
-                          values, firsts, prefix, suffix) where {D,T}
+INTERNAL METHOD.
+Fill a physical-coordinate gradient without allocating term vectors.
+"""
+function _gradient_point!(
+    output, 
+    evaluator::CPUGradientEvaluator{D,T}, 
+    x,
+    values, 
+    firsts, 
+    prefix, 
+    suffix
+) where {D,T}
     fill!(output, zero(T))
     for k in axes(evaluator.indices, 1)
         for d in 1:D
@@ -896,10 +1623,24 @@ function _gradient_point!(output, evaluator::CPUGradientEvaluator{D,T}, x,
     end
     return output
 end
+# ------------------------------------------------------------------------------
+"""
+    _hessian_point!(output, evaluator::CPUHessianEvaluator{D,T}, x,
+values, firsts, seconds, prefix, suffix) where {D,T}
 
-"""Fill a physical-coordinate Hessian using `O(D)` term workspace."""
-function _hessian_point!(output, evaluator::CPUHessianEvaluator{D,T}, x,
-                         values, firsts, seconds, prefix, suffix) where {D,T}
+INTERNAL METHOD.
+Fill a physical-coordinate Hessian using `O(D)` term workspace.
+"""
+function _hessian_point!(
+    output, 
+    evaluator::CPUHessianEvaluator{D,T}, 
+    x,
+    values, 
+    firsts, 
+    seconds, 
+    prefix, 
+    suffix
+) where {D,T}
     fill!(output, zero(T))
     for k in axes(evaluator.indices, 1)
         for d in 1:D
@@ -922,7 +1663,7 @@ function _hessian_point!(output, evaluator::CPUHessianEvaluator{D,T}, x,
                     middle_product *= values[l - 1]
                 end
                 other_product = prefix[j] * middle_product * suffix[l + 1]
-                contribution = coefficient * firsts[j] * firsts[l] * other_product
+                contribution = coefficient * firsts[j]*firsts[l] * other_product
                 output[j, l] += contribution
                 output[l, j] += contribution
             end
@@ -930,8 +1671,12 @@ function _hessian_point!(output, evaluator::CPUHessianEvaluator{D,T}, x,
     end
     return output
 end
+# ------------------------------------------------------------------------------
+"""
+    (evaluator::CPUGradientEvaluator{D,T})(x::AbstractVector) where {D,T}
 
-"""Evaluate a prepared physical-coordinate gradient at one point."""
+    Evaluate a prepared physical-coordinate gradient at one point.
+"""
 function (evaluator::CPUGradientEvaluator{D,T})(x::AbstractVector) where {D,T}
     _validate_point(evaluator.domain, x)
     output = Vector{T}(undef, D)
@@ -939,10 +1684,14 @@ function (evaluator::CPUGradientEvaluator{D,T})(x::AbstractVector) where {D,T}
     firsts = Vector{T}(undef, D)
     prefix = Vector{T}(undef, D + 1)
     suffix = Vector{T}(undef, D + 1)
-    return _gradient_point!(output, evaluator, x, values, firsts, prefix, suffix)
+    return _gradient_point!(output, evaluator, x, values, firsts, prefix,suffix)
 end
-
-"""Evaluate prepared gradients for `N` point rows, returning an `N × D` matrix."""
+# ------------------------------------------------------------------------------
+"""
+    (evaluator::CPUGradientEvaluator{D,T})(X::AbstractMatrix) where {D,T}
+    
+Evaluate prepared gradients for `N` point rows, returning an `N × D` matrix.
+"""
 function (evaluator::CPUGradientEvaluator{D,T})(X::AbstractMatrix) where {D,T}
     _validate_points(evaluator.domain, X)
     output = Matrix{T}(undef, size(X, 1), D)
@@ -951,98 +1700,191 @@ function (evaluator::CPUGradientEvaluator{D,T})(X::AbstractMatrix) where {D,T}
     prefix = Vector{T}(undef, D + 1)
     suffix = Vector{T}(undef, D + 1)
     for i in axes(X, 1)
-        _gradient_point!(@view(output[i, :]), evaluator, @view(X[i, :]),
-                         values, firsts, prefix, suffix)
+        _gradient_point!(
+            @view(output[i, :]), 
+            evaluator, 
+            @view(X[i, :]),
+            values, 
+            firsts, 
+            prefix, 
+            suffix
+        )
     end
     return output
 end
+# ------------------------------------------------------------------------------
+"""
+    (evaluator::CPUHessianEvaluator{D,T})(x::AbstractVector) where {D,T}
 
-
-"""Evaluate a prepared physical-coordinate Hessian at one point."""
+Evaluate a prepared physical-coordinate Hessian at one point.
+"""
 function (evaluator::CPUHessianEvaluator{D,T})(x::AbstractVector) where {D,T}
     _validate_point(evaluator.domain, x)
-    output = Matrix{T}(undef, D, D)
-    values = Vector{T}(undef, D)
-    firsts = Vector{T}(undef, D)
+    output  = Matrix{T}(undef, D, D)
+    values  = Vector{T}(undef, D)
+    firsts  = Vector{T}(undef, D)
     seconds = Vector{T}(undef, D)
-    prefix = Vector{T}(undef, D + 1)
-    suffix = Vector{T}(undef, D + 1)
-    return _hessian_point!(output, evaluator, x, values, firsts, seconds,
-                           prefix, suffix)
+    prefix  = Vector{T}(undef, D + 1)
+    suffix  = Vector{T}(undef, D + 1)
+    return _hessian_point!(
+        output, 
+        evaluator, 
+        x, 
+        values, 
+        firsts, 
+        seconds,
+        prefix, 
+        suffix
+    )
 end
+# ------------------------------------------------------------------------------
+"""
+    (evaluator::CPUHessianEvaluator{D,T})(X::AbstractMatrix) where {D,T}
 
-"""Evaluate prepared Hessians for `N` rows, returning `Vector{Matrix{T}}`."""
+Evaluate prepared Hessians for `N` rows, returning `Vector{Matrix{T}}`.
+"""
 function (evaluator::CPUHessianEvaluator{D,T})(X::AbstractMatrix) where {D,T}
     _validate_points(evaluator.domain, X)
-    output = [Matrix{T}(undef, D, D) for _ in axes(X, 1)]
-    values = Vector{T}(undef, D)
-    firsts = Vector{T}(undef, D)
+    output  = [Matrix{T}(undef, D, D) for _ in axes(X, 1)]
+    values  = Vector{T}(undef, D)
+    firsts  = Vector{T}(undef, D)
     seconds = Vector{T}(undef, D)
-    prefix = Vector{T}(undef, D + 1)
-    suffix = Vector{T}(undef, D + 1)
+    prefix  = Vector{T}(undef, D + 1)
+    suffix  = Vector{T}(undef, D + 1)
     for i in axes(X, 1)
-        _hessian_point!(output[i], evaluator, @view(X[i, :]), values, firsts,
-                        seconds, prefix, suffix)
+        _hessian_point!(
+            output[i], 
+            evaluator, 
+            @view(X[i, :]), 
+            values, 
+            firsts,
+            seconds, 
+            prefix, 
+            suffix
+        )
     end
     return output
 end
 
-const _BACKEND_FACTORIES = Dict{Symbol,Any}()
-const _GRADIENT_BACKEND_FACTORIES = Dict{Symbol,Any}()
-const _HESSIAN_BACKEND_FACTORIES = Dict{Symbol,Any}()
 
-"""Register an optional backend factory. Intended for sidecar extensions."""
+
+
+
+
+
+
+
+
+
+
+
+# ==============================================================================
+# REGISTRATION FOR OPTIONAL BACKEND FACTORY (FOR GPU EXTENSIONS)
+# ALSO GIVES `available_backends()`
+# ==============================================================================
+const _BACKEND_FACTORIES          = Dict{Symbol,Any}()
+const _GRADIENT_BACKEND_FACTORIES = Dict{Symbol,Any}()
+const _HESSIAN_BACKEND_FACTORIES  = Dict{Symbol,Any}()
+# ------------------------------------------------------------------------------
+"""
+    _register_backend!(name::Symbol, factory)
+
+INTERNAL METHOD. Register an optional backend factory. Intended for sidecar 
+extensions.
+"""
 function _register_backend!(name::Symbol, factory)
-    name in (:cpu, :auto) && throw(ArgumentError("backend name $name is reserved"))
+    name in (:cpu, :auto) && throw(ArgumentError(
+        "backend name $name is reserved"
+    ))
     _BACKEND_FACTORIES[name] = factory
     return name
 end
+# ------------------------------------------------------------------------------
+"""
+    _register_gradient_backend!(name::Symbol, factory)
 
-"""Register an optional prepared-gradient backend factory."""
+INTERNAL METHOD. Register an optional prepared-gradient backend factory.
+"""
 function _register_gradient_backend!(name::Symbol, factory)
-    name in (:cpu, :auto) && throw(ArgumentError("backend name $name is reserved"))
+    name in (:cpu, :auto) && throw(ArgumentError(
+        "backend name $name is reserved"
+    ))
     _GRADIENT_BACKEND_FACTORIES[name] = factory
     return name
 end
+# ------------------------------------------------------------------------------
+"""
+    _register_hessian_backend!(name::Symbol, factory)
 
-
-"""Register an optional prepared-Hessian backend factory."""
+INTERNAL METHOD. Register an optional prepared-Hessian backend factory.
+"""
 function _register_hessian_backend!(name::Symbol, factory)
-    name in (:cpu, :auto) && throw(ArgumentError("backend name $name is reserved"))
+    name in (:cpu, :auto) && throw(ArgumentError(
+        "backend name $name is reserved"
+    ))
     _HESSIAN_BACKEND_FACTORIES[name] = factory
     return name
 end
+# ------------------------------------------------------------------------------
+"""
+    available_backends()
 
-"""Return registered executable backends, always beginning with `:cpu`."""
+Return registered executable backends, always beginning with `:cpu`. Can consist
+of `:cpu`, `:cuda`, `:metal`.
+"""
 function available_backends()
     preferred = (:cuda, :metal)
-    known = Symbol[:cpu]
+    known     = Symbol[:cpu]
     append!(known, filter(name -> haskey(_BACKEND_FACTORIES, name), preferred))
-    extras = sort!(collect(setdiff(keys(_BACKEND_FACTORIES), preferred)))
+    extras    = sort!(collect(setdiff(keys(_BACKEND_FACTORIES), preferred)))
     append!(known, extras)
     return Tuple(known)
 end
 
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+# ==============================================================================
+# Preparation APIs
+# ==============================================================================
 """
     prepare(res; T=eltype(coefficients(res)), backend=:cpu)
 
 Create reusable backend-ready evaluator data. `:auto` conservatively selects
 CPU and never changes precision. Optional sidecars register other backends.
 """
-function prepare(res::SmolyakApproximation; T::Type{<:AbstractFloat} =
-                 eltype(res.coeffs), backend::Symbol = :cpu)
+function prepare(
+    res     ::SmolyakApproximation; 
+    T       ::Type{<:AbstractFloat} = eltype(res.coeffs), 
+    backend ::Symbol = :cpu
+)
     selected = backend === :auto ? :cpu : backend
     if selected === :cpu
         return CPUPreparedEvaluator{dimension(res),T,typeof(res.domain)}(
-            res.domain, T.(res.coeffs), _index_matrix(res.basis.indices))
+            res.domain, 
+            T.(res.coeffs), 
+            _index_matrix(res.basis.indices)
+        )
     end
     factory = get(_BACKEND_FACTORIES, selected, nothing)
     factory === nothing && throw(ArgumentError(
         "backend $selected is unavailable; loaded backends are " *
-        "$(available_backends()). Load its optional sidecar first."))
+        "$(available_backends()). Load its optional sidecar first."
+    ))
     return factory(res, T)
 end
-
+# ------------------------------------------------------------------------------
 """
     prepare_gradient(res; T=eltype(coefficients(res)), backend=:cpu)
 
@@ -1051,21 +1893,27 @@ coordinates. A point call returns `Vector{T}` of length `D`; an `N × D` batch
 returns `Matrix{T}` of size `N × D`. `:auto` currently selects CPU. Optional
 extensions provide GPU factories while preserving explicit precision.
 """
-function prepare_gradient(res::SmolyakApproximation;
-                          T::Type{<:AbstractFloat} = eltype(res.coeffs),
-                          backend::Symbol = :cpu)
+function prepare_gradient(
+    res::SmolyakApproximation;
+    T::Type{<:AbstractFloat} = eltype(res.coeffs),
+    backend::Symbol = :cpu
+)
     selected = backend === :auto ? :cpu : backend
     if selected === :cpu
         return CPUGradientEvaluator{dimension(res),T,typeof(res.domain)}(
-            res.domain, T.(res.coeffs), _index_matrix(res.basis.indices))
+            res.domain, 
+            T.(res.coeffs), 
+            _index_matrix(res.basis.indices)
+        )
     end
     factory = get(_GRADIENT_BACKEND_FACTORIES, selected, nothing)
     factory === nothing && throw(ArgumentError(
         "gradient backend $selected is unavailable; load its optional " *
-        "extension before calling prepare_gradient"))
+        "extension before calling prepare_gradient"
+    ))
     return factory(res, T)
 end
-
+# ------------------------------------------------------------------------------
 """
     prepare_hessian(res; T=eltype(coefficients(res)), backend=:cpu)
 
@@ -1073,53 +1921,89 @@ Prepare repeated evaluation of the Hessian of `res` with respect to physical
 coordinates. A point call returns a `D × D Matrix{T}`; an `N × D` batch returns
 `Vector{Matrix{T}}` with one Hessian per row. `:auto` currently selects CPU.
 """
-function prepare_hessian(res::SmolyakApproximation;
-                         T::Type{<:AbstractFloat} = eltype(res.coeffs),
-                         backend::Symbol = :cpu)
+function prepare_hessian(
+    res::SmolyakApproximation;
+    T::Type{<:AbstractFloat} = eltype(res.coeffs),
+    backend::Symbol = :cpu
+)
     selected = backend === :auto ? :cpu : backend
     if selected === :cpu
         return CPUHessianEvaluator{dimension(res),T,typeof(res.domain)}(
-            res.domain, T.(res.coeffs), _index_matrix(res.basis.indices))
+            res.domain, 
+            T.(res.coeffs), 
+            _index_matrix(res.basis.indices)
+        )
     end
     factory = get(_HESSIAN_BACKEND_FACTORIES, selected, nothing)
     factory === nothing && throw(ArgumentError(
         "Hessian backend $selected is unavailable; load its optional " *
-        "extension before calling prepare_hessian"))
+        "extension before calling prepare_hessian"
+    ))
     return factory(res, T)
 end
 
-# ------------------------------------------------------------------------------
-# Versioned JSON serialization
-# ------------------------------------------------------------------------------
 
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+# ==============================================================================
+# Versioned JSON serialization & `save()` API
+# ==============================================================================
 """Read and parse a JSON object, adding a useful filename to parse errors."""
 function _read_json(path::AbstractString)
-    isfile(path) || throw(ArgumentError("serialized file does not exist: $path"))
+    isfile(path) || throw(ArgumentError(
+        "serialized file does not exist: $path"
+    ))
     try
         return JSON3.read(read(path, String))
     catch error
-        throw(ArgumentError("could not parse serialized JSON file $path: $error"))
+        throw(ArgumentError(
+            "could not parse serialized JSON file $path: $error"
+        ))
     end
 end
-
+# ------------------------------------------------------------------------------
 """Validate a serialized object's schema version and kind."""
 function _validate_serialized(data, expected_kind::AbstractString)
-    haskey(data, :format_version) || throw(ArgumentError("missing format_version"))
+    haskey(data, :format_version) || throw(ArgumentError(
+        "missing format_version"
+    ))
     data.format_version == FORMAT_VERSION || throw(ArgumentError(
-        "unsupported format_version $(data.format_version); expected $FORMAT_VERSION"))
-    haskey(data, :kind) && String(data.kind) == expected_kind || throw(ArgumentError(
-        "serialized object kind must be $expected_kind"))
+        "unsupported format_version $(data.format_version); " * 
+        "expected $FORMAT_VERSION"
+    ))
+    haskey(data,:kind)&&String(data.kind)==expected_kind || throw(ArgumentError(
+        "serialized object kind must be $expected_kind"
+    ))
     return nothing
 end
-
+# ------------------------------------------------------------------------------
 """Return the serializable dictionary for a domain."""
 function _domain_data(domain::BoxDomain)
-    return Dict("format_version" => FORMAT_VERSION, "kind" => "BoxDomain",
-                "numeric_type" => string(eltype(domain.lb)),
-                "lower_bounds" => collect(domain.lb),
-                "upper_bounds" => collect(domain.ub))
+    return Dict(
+        "format_version" => FORMAT_VERSION, 
+        "kind" => "BoxDomain",
+        "numeric_type" => string(eltype(domain.lb)),
+        "lower_bounds" => collect(domain.lb),
+        "upper_bounds" => collect(domain.ub)
+    )
 end
-
+# ------------------------------------------------------------------------------
 """Recover the requested floating type from a supported serialized name."""
 function _serialized_float(name)
     value = String(name)
@@ -1127,90 +2011,133 @@ function _serialized_float(name)
     value == "Float64" && return Float64
     throw(ArgumentError("unsupported serialized floating type $value"))
 end
-
+# ------------------------------------------------------------------------------
 """Load a validated domain JSON object."""
 function _load_domain(data)
     _validate_serialized(data, "BoxDomain")
     T = _serialized_float(data.numeric_type)
     return BoxDomain(T.(data.lower_bounds), T.(data.upper_bounds))
 end
-
+# ------------------------------------------------------------------------------
 """Return the serializable dictionary for a sparse grid."""
 function _grid_data(grid::SmolyakGrid)
-    return Dict("format_version" => FORMAT_VERSION, "kind" => "SmolyakGrid",
-                "domain" => _domain_data(grid.domain),
-                "max_levels" => collect(grid.max_levels),
-                "level_budget" => grid.level_budget, "rule" => String(grid.rule),
-                "indices" => [collect(index) for index in grid.indices],
-                "nodes" => [collect(@view grid.nodes[i, :]) for i in axes(grid.nodes, 1)])
+    return Dict(
+        "format_version" => FORMAT_VERSION, 
+        "kind"           => "SmolyakGrid",
+        "domain"         => _domain_data(grid.domain),
+        "max_levels"     => collect(grid.max_levels),
+        "level_budget"   => grid.level_budget, 
+        "rule"    => String(grid.rule),
+        "indices" => [collect(index) for index in grid.indices],
+        "nodes"   => [
+            collect(@view grid.nodes[i, :]) 
+            for i in axes(grid.nodes, 1)
+        ]
+    )
 end
-
+# ------------------------------------------------------------------------------
 """Load a validated grid JSON object and verify deterministic reconstruction."""
 function _load_grid(data)
     _validate_serialized(data, "SmolyakGrid")
     domain = _load_domain(data.domain)
-    grid = SmolyakGrid(Int.(data.max_levels), Int(data.level_budget), domain;
-                       rule = Symbol(data.rule))
-    stored_indices = [ntuple(d -> Int(row[d]), dimension(domain)) for row in data.indices]
+    grid   = SmolyakGrid(
+        Int.(data.max_levels), 
+        Int(data.level_budget), 
+        domain;
+        rule = Symbol(data.rule)
+    )
+    stored_indices = [
+        ntuple(d -> Int(row[d]), dimension(domain)) 
+        for row in data.indices
+    ]
     stored_nodes = reduce(vcat, permutedims.(collect.(data.nodes)))
     T = eltype(domain.lb)
     stored_matrix = T.(stored_nodes)
     grid.indices == stored_indices || throw(ArgumentError(
-        "serialized grid indices do not match its reconstruction metadata"))
+        "serialized grid indices do not match its reconstruction metadata"
+    ))
     grid.nodes == stored_matrix || throw(ArgumentError(
-        "serialized grid nodes do not match deterministic reconstruction"))
+        "serialized grid nodes do not match deterministic reconstruction"
+    ))
     return grid
 end
-
+# ------------------------------------------------------------------------------
 """Return the serializable dictionary for a basis specification."""
 function _basis_data(basis::ChebyshevBasisSpec)
-    return Dict("format_version" => FORMAT_VERSION,
-                "kind" => "ChebyshevBasisSpec",
-                "max_orders" => collect(basis.max_orders),
-                "order_budget" => basis.order_budget,
-                "indices" => [collect(index) for index in basis.indices])
+    return Dict(
+        "format_version" => FORMAT_VERSION,
+        "kind"           => "ChebyshevBasisSpec",
+        "max_orders"     => collect(basis.max_orders),
+        "order_budget"   => basis.order_budget,
+        "indices"        => [collect(index) for index in basis.indices]
+    )
 end
-
+# ------------------------------------------------------------------------------
 """Load and validate a basis JSON object."""
 function _load_basis(data)
     _validate_serialized(data, "ChebyshevBasisSpec")
     basis = ChebyshevBasisSpec(Int.(data.max_orders), Int(data.order_budget))
-    stored = [ntuple(d -> Int(row[d]), dimension(basis)) for row in data.indices]
+    stored = [
+        ntuple(d -> Int(row[d]), dimension(basis)) 
+        for row in data.indices
+    ]
     basis.indices == stored || throw(ArgumentError(
-        "serialized basis indices do not match its reconstruction metadata"))
+        "serialized basis indices do not match its reconstruction metadata"
+    ))
     return basis
 end
+# ------------------------------------------------------------------------------
 
 """Return persistent approximation data without runtime/factorization state."""
 function _approximation_data(res::SmolyakApproximation)
-    return Dict("format_version" => FORMAT_VERSION,
-                "kind" => "SmolyakApproximation",
-                "grid" => _grid_data(res.grid), "basis" => _basis_data(res.basis),
-                "coefficient_type" => string(eltype(res.coeffs)),
-                "coefficients" => res.coeffs, "system_type" => String(res.system_type),
-                "solver" => String(res.solver), "ridge_lambda" => res.ridge_lambda,
-                "node_rmse" => res.node_rmse,
-                "max_node_error" => res.max_node_error)
+    return Dict(
+        "format_version"   => FORMAT_VERSION,
+        "kind"             => "SmolyakApproximation",
+        "grid"             => _grid_data(res.grid), 
+        "basis"            => _basis_data(res.basis),
+        "coefficient_type" => string(eltype(res.coeffs)),
+        "coefficients"     => res.coeffs, 
+        "system_type"      => String(res.system_type),
+        "solver"           => String(res.solver), 
+        "ridge_lambda"     => res.ridge_lambda,
+        "node_rmse"        => res.node_rmse,
+        "max_node_error"   => res.max_node_error
+    )
 end
-
+# ------------------------------------------------------------------------------
 """Load and validate an approximation JSON object."""
 function _load_approximation(data)
     _validate_serialized(data, "SmolyakApproximation")
     grid = _load_grid(data.grid)
     basis = _load_basis(data.basis)
     dimension(grid) == dimension(basis) || throw(DimensionMismatch(
-        "serialized grid and basis dimensions differ"))
+        "serialized grid and basis dimensions differ"
+    ))
     T = _serialized_float(data.coefficient_type)
     coeffs = T.(data.coefficients)
     length(coeffs) == length(basis) || throw(DimensionMismatch(
-        "serialized coefficient count does not match the basis"))
+        "serialized coefficient count does not match the basis"
+    ))
     D = dimension(grid)
-    return SmolyakApproximation{D,T,typeof(grid.domain),typeof(grid),typeof(basis)}(
-        grid.domain, grid, basis, coeffs, Symbol(data.system_type),
-        Symbol(data.solver), T(data.ridge_lambda), T(data.node_rmse),
-        T(data.max_node_error))
+    return SmolyakApproximation{
+        D,
+        T,
+        typeof(grid.domain),
+        typeof(grid),
+        typeof(basis)
+    }(
+        grid.domain, 
+        grid, 
+        basis, 
+        coeffs, 
+        Symbol(data.system_type),
+        Symbol(data.solver), 
+        T(data.ridge_lambda), 
+        T(data.node_rmse),
+        T(data.max_node_error)
+    )
 end
-
+# ------------------------------------------------------------------------------
 """
     save(obj, path)
 
@@ -1236,5 +2163,30 @@ function save(obj, path::AbstractString)
     end
     return path
 end
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 end # module SmolyakPoly
